@@ -1,0 +1,8 @@
+gradio
+strands-agents
+requests
+python-dotenv
+psycopg2-binary
+pandas
+mcp
+boto3
