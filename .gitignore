@@ -1,0 +1,11 @@
+.DS_Store
+.github
+.databricks
+.vscode
+.env
+.venv
+.bak
+__pycache__
+*.pyc
+*data
+*outputs
