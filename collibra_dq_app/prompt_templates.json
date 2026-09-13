@@ -1,0 +1,425 @@
+{
+  "prompts": [
+    {
+      "id": "update_bu",
+      "category": "Update Dataset",
+      "title": "Business Unit",
+      "description": "Modify the business unit mapping for a dataset",
+      "template": "I want to update the business unit for dataset '{dataset_name}'.",
+      "fields": [
+        {
+          "name": "dataset_name",
+          "label": "Dataset Name",
+          "type": "dropdown",
+          "required": true,
+          "placeholder": "e.g., ds_conn_s3_x",
+          "lookup": "datasets",
+          "options": []
+        }
+      ]
+    },
+    {
+      "id": "update_email_alert",
+      "category": "Update Dataset",
+      "title": "Email Alert",
+      "description": "Configure email notifications for dataset alerts",
+      "template": "I want to update the email alert configuration for dataset '{dataset_name}'. Set the alert email to '{email}'.",
+      "fields": [
+        {
+          "name": "dataset_name",
+          "label": "Dataset Name",
+          "type": "dropdown",
+          "required": true,
+          "placeholder": "e.g., ds_conn_s3_x",
+          "lookup": "datasets",
+          "options": []
+        },
+        {
+          "name": "email",
+          "label": "Email Address",
+          "type": "email",
+          "required": false,
+          "placeholder": "user@example.com"
+        }
+      ]
+    },
+    {
+      "id": "update_dataset_definitions",
+      "category": "Update Dataset",
+      "title": "Dataset Definitions",
+      "description": "Modify dataset definition",
+      "template": "I want to update the dataset definitions for '{dataset_name}'. Requirements: '{requirements}'.",
+      "fields": [
+        {
+          "name": "dataset_name",
+          "label": "Dataset Name",
+          "type": "dropdown",
+          "required": true,
+          "placeholder": "e.g., ds_conn_s3_x",
+          "lookup": "datasets",
+          "options": []
+        },
+        {
+          "name": "requirements",
+          "label": "Requirements",
+          "type": "textarea",
+          "required": false,
+          "placeholder": "Describe requirements (optional)"
+        }
+      ]
+    },
+    {
+      "id": "update_linkid",
+      "category": "Update Dataset",
+      "title": "LinkId",
+      "description": "Update the LinkId mapping for a dataset",
+      "template": "I want to update the linkId for dataset '{dataset_name}'. New linkId: '{new_linkid}'.",
+      "fields": [
+        {
+          "name": "dataset_name",
+          "label": "Dataset Name",
+          "type": "dropdown",
+          "required": true,
+          "placeholder": "e.g., ds_conn_s3_x",
+          "lookup": "datasets",
+          "options": []
+        },
+        {
+          "name": "new_linkid",
+          "label": "New LinkId",
+          "type": "text",
+          "required": false,
+          "placeholder": "Use command separated text for new LinkId values (optional)"
+        }
+      ]
+    },
+    {
+      "id": "update_data_domain",
+      "category": "Update Dataset",
+      "title": "Data Domain Tagging",
+      "description": "Assign or modify data domain tags",
+      "template": "I want to update the data domain tagging for dataset '{dataset_name}'.",
+      "fields": [
+        {
+          "name": "dataset_name",
+          "label": "Dataset Name",
+          "type": "dropdown",
+          "required": true,
+          "placeholder": "e.g., ds_conn_s3_x",
+          "lookup": "datasets",
+          "options": []
+        }
+      ]
+    },
+    {
+      "id": "update_sub_domain",
+      "category": "Update Dataset",
+      "title": "Sub-Domain Tagging",
+      "description": "Assign or modify sub-domain tags",
+      "template": "I want to update the sub-domain tagging for dataset '{dataset_name}'.",
+      "fields": [
+        {
+          "name": "dataset_name",
+          "label": "Dataset Name",
+          "type": "dropdown",
+          "required": true,
+          "placeholder": "e.g., ds_conn_s3_x",
+          "lookup": "datasets",
+          "options": []
+        }
+      ]
+    },
+    {
+      "id": "create_s3_dataset",
+      "category": "Create Dataset",
+      "title": "Create New S3 Dataset",
+      "description": "Set up a new DQ dataset from S3 source",
+      "template": "I want to create a new DQ dataset from S3. S3 path: '{s3_path}'. Market: '{market}'.",
+      "fields": [
+        {
+          "name": "s3_path",
+          "label": "S3 Path",
+          "type": "text",
+          "required": true,
+          "placeholder": "s3://bucket-name/path/to/file.csv"
+        },
+        {
+          "name": "market",
+          "label": "Market",
+          "type": "text",
+          "required": true,
+          "placeholder": "e.g., JP, ANZ, KR, CN, REGION"
+        }
+      ]
+    },
+    {
+      "id": "create_redshift_dataset",
+      "category": "Create Dataset",
+      "title": "Create New Redshift Dataset",
+      "description": "Set up a new DQ dataset from Redshift table",
+      "template": "I want to create a new DQ dataset from Redshift. Schema: '{schema}'. Table: '{table_name}'.",
+      "fields": [
+        {
+          "name": "schema",
+          "label": "Schema Name",
+          "type": "text",
+          "required": true,
+          "placeholder": "e.g., jp, anz, cn, na, kr, pixonomy"
+        },
+        {
+          "name": "table_name",
+          "label": "Table Name",
+          "type": "text",
+          "required": true,
+          "placeholder": "e.g., itg_account"
+        }
+      ]
+    },
+    {
+      "id": "create_custom_rule",
+      "category": "Custom Rules",
+      "title": "Create DQ Custom Rule",
+      "description": "Define a new custom data quality rule",
+      "template": "I want to create a new DQ custom rule for dataset '{dataset_name}'. Rule description: '{rule_desc}'. SQL condition: '{rule_sql}'.",
+      "fields": [
+        {
+          "name": "dataset_name",
+          "label": "Dataset Name",
+          "type": "dropdown",
+          "required": true,
+          "placeholder": "e.g., ds_conn_s3_x, or anz.itg_account",
+          "lookup": "datasets",
+          "options": []
+        },
+        {
+          "name": "rule_desc",
+          "label": "Rule Description",
+          "type": "textarea",
+          "required": true,
+          "placeholder": "Describe what this rule checks"
+        },
+        {
+          "name": "rule_sql",
+          "label": "Rule SQL",
+          "type": "textarea",
+          "required": false,
+          "placeholder": "Optional, e.g. SELECT * FROM @dataset_name WHERE condition"
+        }
+      ]
+    },
+    {
+      "id": "update_custom_rule",
+      "category": "Custom Rules",
+      "title": "Update DQ Custom Rule",
+      "description": "Modify an existing custom rule",
+      "template": "I want to update the custom rule '{rule_name}' for dataset '{dataset_name}'. Changes: '{rule_sql}'.",
+      "fields": [
+        {
+          "name": "dataset_name",
+          "label": "Dataset Name",
+          "type": "dropdown",
+          "required": true,
+          "placeholder": "e.g., ds_conn_s3_x",
+          "lookup": "datasets",
+          "options": []
+        },
+        {
+          "name": "rule_name",
+          "label": "Rule Name",
+          "type": "text",
+          "required": true,
+          "placeholder": "e.g., unique_customer_id"
+        },
+        {
+          "name": "rule_sql",
+          "label": "New Rule",
+          "type": "textarea",
+          "required": true,
+          "placeholder": "Describe the changes or paste the new SQL here"
+        }
+      ]
+    },
+    {
+      "id": "query_jira_tickets",
+      "category": "JIRA Operations",
+      "title": "Query JIRA Tickets",
+      "description": "Search for and retrieve JIRA tickets",
+      "template": "I want to query JIRA tickets with the following criteria: Project: '{project}'. Status: '{status}'. Search text: '{search_text}'.",
+      "fields": [
+        {
+          "name": "project",
+          "label": "JIRA Project",
+          "type": "text",
+          "required": true,
+          "placeholder": "e.g., ANGen, iDiscover Regional MDM, iDiscover Data Quality"
+        },
+        {
+          "name": "status",
+          "label": "Status Filter",
+          "type": "text",
+          "required": false,
+          "placeholder": "e.g., Open, In Progress, Completed"
+        },
+        {
+          "name": "search_text",
+          "label": "Search Text",
+          "type": "text",
+          "required": false,
+          "placeholder": "Keywords to search for"
+        }
+      ]
+    },
+    {
+      "id": "submit_new_dq_setup",
+      "category": "JIRA Operations",
+      "title": "Submit DQ JIRA Ticket (New DQ Setup)",
+      "description": "Create a new JIRA ticket for dataset setup",
+      "template": "I want to submit a new DQ setup JIRA ticket. Project: '{project}'. Table name: '{table_name}'. Description: '{description}'. Data source: '{data_source}'.",
+      "fields": [
+        {
+          "name": "project",
+          "label": "JIRA Project",
+          "type": "text",
+          "required": true,
+          "placeholder": "e.g., JGPV"
+        },
+        {
+          "name": "table_name",
+          "label": "Table Name",
+          "type": "text",
+          "required": true,
+          "placeholder": "e.g., anz.itg_account"
+        },
+        {
+          "name": "description",
+          "label": "Description",
+          "type": "textarea",
+          "required": true,
+          "placeholder": "Describe the new DQ setup request"
+        },
+        {
+          "name": "data_source",
+          "label": "Data Source",
+          "type": "text",
+          "required": true,
+          "placeholder": "e.g., S3, Redshift"
+        }
+      ]
+    },
+    {
+      "id": "submit_dq_change_request",
+      "category": "JIRA Operations",
+      "title": "Submit DQ JIRA Ticket (Change Request)",
+      "description": "Create a JIRA ticket for dataset configuration changes",
+      "template": "I want to submit a DQ change request JIRA ticket. Project: '{project}'. Dataset: '{dataset_name}'. Change type: '{change_type}'. Details: '{details}'.",
+      "fields": [
+        {
+          "name": "project",
+          "label": "JIRA Project",
+          "type": "text",
+          "required": true,
+          "placeholder": "e.g., JGPV"
+        },
+        {
+          "name": "dataset_name",
+          "label": "Dataset Name",
+          "type": "dropdown",
+          "required": true,
+          "placeholder": "e.g., ds_conn_s3_x",
+          "lookup": "datasets",
+          "options": []
+        },
+        {
+          "name": "change_type",
+          "label": "Change Type",
+          "type": "text",
+          "required": true,
+          "placeholder": "e.g., Add Rule, Update Domain, Modify Alert"
+        },
+        {
+          "name": "details",
+          "label": "Change Details",
+          "type": "textarea",
+          "required": true,
+          "placeholder": "Describe the requested changes"
+        }
+      ]
+    },
+    {
+      "id": "inspect_findings",
+      "category": "Query & Inspect",
+      "title": "Inspect DQ Findings",
+      "description": "Review data quality findings for a dataset",
+      "template": "I want to inspect the DQ findings for dataset '{dataset_name}'. Time period: '{time_period}'. Severity: '{severity}'.",
+      "fields": [
+        {
+          "name": "dataset_name",
+          "label": "Dataset Name",
+          "type": "dropdown",
+          "required": true,
+          "placeholder": "e.g., ds_conn_s3_x",
+          "lookup": "datasets",
+          "options": []
+        },
+        {
+          "name": "time_period",
+          "label": "Time Period",
+          "type": "text",
+          "required": false,
+          "placeholder": "e.g., Last 7 days, Last month"
+        },
+        {
+          "name": "severity",
+          "label": "Severity Filter",
+          "type": "text",
+          "required": false,
+          "placeholder": "e.g., Critical, High, Medium, Low"
+        }
+      ]
+    },
+    {
+      "id": "inspect_configurations",
+      "category": "Query & Inspect",
+      "title": "Inspect DQ Configurations",
+      "description": "Review dataset configuration and metadata",
+      "template": "I want to inspect the DQ configurations for dataset '{dataset_name}'.",
+      "fields": [
+        {
+          "name": "dataset_name",
+          "label": "Dataset Name",
+          "type": "dropdown",
+          "required": true,
+          "placeholder": "e.g., ds_conn_s3_x",
+          "lookup": "datasets",
+          "options": []
+        }
+      ]
+    },
+    {
+      "id": "best_practices",
+      "category": "Information",
+      "title": "DQ Best Practices",
+      "description": "Learn about DQ best practices",
+      "template": "I want to know about DQ best practices, especially regarding: '{topic}'.",
+      "fields": [
+        {
+          "name": "topic",
+          "label": "Topic",
+          "type": "dropdown",
+          "required": false,
+          "placeholder": "Select a topic or enter custom question",
+          "options": [
+            "General guidelines",
+            "DQ custom rule best practices",
+            "Collibra DQ rules and dimensions",
+            "New DQ set-up request",
+            "Data Domain categories",
+            "Sub domain categories",
+            "Business unit settings",
+            "Collibra adaptive rules"
+          ]
+        }
+      ]
+    }
+  ]
+}
