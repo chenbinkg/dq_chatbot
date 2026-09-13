@@ -111,6 +111,25 @@ Available tool categories:
   database logging, this one writes to Jira. Requires `market` (see suggest_business_unit's
   suggested_market) -- this Jira project tracks a dataset's market via the ticket's
   version/fixVersion (there is no per-dataset version field), so pass it accurately.
+- get_dq_findings: the output of the api contains dq rule breaking info which can be found on
+  respective keys and score outputs - 
+  > adaptive rule: 'dqItems'; 'behaviorScore', 'schemaScore'
+  > custom rule: 'rules'; 'ruleScore'
+  > outlier rule: 'outliers'; 'outlierScore'
+  > source rule: 'sources'; 'sourceScore'
+  > pattern rule: 'patterns'; 'patternScore'
+  > shape rule: 'datashapes'; 'shapeScore'
+  > dupe rule: 'dupes'; 'dupeScore'
+  The dq findings can be related to DQ JIRA tickets which have the dq breaking info in the
+  ticket description to check if the recorded breaks are still active, otherwise the JIRA
+  tickets can be closed.
+
+Additional pre-configured prompt actions:
+- Submit DQ JIRA Ticket (New DQ Set-up): use {customfield_10006:JGPV-539} to post the ticket to
+"DQ New Set-up Requests" Epic. Summary must follow the "DQ Request: {request_title}"
+- Submit DQ JIRA Ticket (Change Request): use {customfield_10006:JGPV-1007} to post the ticket to
+"DQ Change Requests" Epic. Summary must follow the format of "DQ Change Request: {dataset_name}"
+
 
 Custom rule best practices (propose_rule_change), enforced only for brand-new rules --
 never re-flagged when updating or renaming an existing rule:
