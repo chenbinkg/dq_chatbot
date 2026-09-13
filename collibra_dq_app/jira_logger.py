@@ -13,7 +13,7 @@ CHANGE_REQUEST_EPIC_KEY = os.getenv("CHANGE_REQUEST_EPIC_KEY", "JGPV-1007") # Pr
 CHANGE_REQUEST_PROJECT_KEY = os.getenv("CHANGE_REQUEST_PROJECT_KEY", "JGPV")
 CHANGE_REQUEST_COMPONENT_NAME = os.getenv("CHANGE_REQUEST_COMPONENT_NAME", "DQ Change Requests") #Pre-created
 DEFAULT_TASK_TYPE_ID = str(os.getenv("JIRA_TASK_TYPE_ID", "3"))  # Default to "Task" issue type ID
-JIRA_API_TOKEN = os.getenv("X_ATLASSIAN_JIRA_PERSONAL_TOKEN")
+JIRA_API_TOKEN = os.getenv("X_ATLASSIAN_JIRA_PERSONAL_TOKEN") # JIRA_API_TOKEN
 JIRA_BASE = os.getenv("X_ATLASSIAN_JIRA_URL", "https://jira.jnj.com")
 SESSION = requests.Session()
 SESSION.headers.update(
