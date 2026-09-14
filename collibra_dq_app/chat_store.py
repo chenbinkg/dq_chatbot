@@ -194,6 +194,47 @@ def log_changes(rows: list[dict[str, Any]]) -> None:
         conn.commit()
 
 
+def get_change_history(
+    dataset: str,
+    region: Optional[str] = None,
+    change_category: Optional[str] = None,
+    since_days: Optional[int] = None,
+    limit: int = 200,
+) -> list[dict[str, Any]]:
+    """Return change-history rows for one dataset, newest first. Optional filters on
+    region, change_category, and how far back to look (in days)."""
+    if not dataset:
+        raise ValueError("dataset is required to read change history.")
+    where = ["dataset = %s"]
+    params: list[Any] = [dataset]
+    if region:
+        where.append("region = %s")
+        params.append(region)
+    if change_category:
+        where.append("change_category = %s")
+        params.append(change_category)
+    if since_days and since_days > 0:
+        where.append("changed_at >= now() - make_interval(days => %s)")
+        params.append(int(since_days))
+    params.append(max(1, min(int(limit or 200), 1000)))
+
+    sql = f"""
+        SELECT id, dataset, region, session_id, dataset_category, change_category,
+               change_item, change_from, change_to, change_reason, change_by, changed_at
+        FROM {CHANGE_HISTORY_TABLE}
+        WHERE {' AND '.join(where)}
+        ORDER BY changed_at DESC, id DESC
+        LIMIT %s
+    """
+    settings = _settings_for(CHANGE_HISTORY_TABLE)
+    with connect(settings) as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, params)
+            columns = [desc[0] for desc in cur.description]
+            rows = cur.fetchall()
+    return [dict(zip(columns, row)) for row in rows]
+
+
 if __name__ == "__main__":
     try:
         from dotenv import load_dotenv
