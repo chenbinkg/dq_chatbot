@@ -1,56 +1,10 @@
 # J&J Collibra DQ Chatbot
 
-An AI-assisted operations tool for inspecting, diagnosing, and maintaining J&J Collibra Data Quality (CDQ) dataset definitions. The repository combines a local Gradio chat application, a Strands agent, a custom J&J GenAI Gateway model provider, direct Collibra DQ REST tools, Redshift inspection helpers, curated business-unit lookups, and optional Atlassian MCP tools.
+An AI-assisted operations tool for inspecting, diagnosing, and maintaining J&J Collibra Data Quality (CDQ) dataset definitions. The repository combines a local Gradio chat application, a Strands agent, a custom J&J GenAI Gateway model provider, direct Collibra DQ REST tools, Redshift inspection helpers, curated business-unit lookups, and additional Atlassian MCP tools for JIRA operations.
 
-The primary application is intended for a small group of Collibra DQ super-users. It can read live configuration and, after an explicit preview-and-confirm interaction, update dataset definitions, alerts, and business-unit assignments.
+The original application is intended for a small group of Collibra DQ super-users. It can read live configuration and, after an explicit preview-and-confirm interaction, update dataset definitions, alerts, and business-unit assignments. After the infra is set up with authentications, the chatbot can be released to a larger group of people who have collaboration works with Data Quality team, including Data Stewards, Tech Owners and Data Owners.
 
-## Features
-
-### Pre-Configured Prompt Templates
-
-The chatbot now includes a library of 16 pre-configured prompt templates organized into 6 categories:
-
-**Update Dataset** (6 templates)
-- Business Unit mapping update
-- Email alert configuration
-- Dataset definitions and metadata
-- LinkId updates
-- Data Domain tagging
-- Sub-Domain tagging
-
-**Create Dataset** (2 templates)
-- S3-backed dataset creation
-- Redshift table-backed dataset creation
-
-**Custom Rules** (2 templates)
-- Create new custom DQ rules
-- Update existing custom rules
-
-**JIRA Operations** (3 templates)
-- Query existing JIRA tickets
-- Submit new DQ setup requests
-- Submit DQ change requests
-
-**Query & Inspect** (2 templates)
-- Inspect DQ findings by dataset and time period
-- Inspect DQ configurations and rules
-
-**Information** (1 template)
-- DQ best practices and guidance with 8 predefined topics (customizable)
-
-#### Features
-- **Smart Field Types**: Templates support text, textarea, and dropdown fields with optional lookups to database tables
-- **Dataset Name Lookup**: A "Query" button on dataset_name fields fetches available datasets from `public.dqm_business_unit_mapping`
-- **Dynamic Form Rendering**: Forms hide/show and auto-populate based on selected template
-- **Required Field Validation**: Submit button enables only when all required fields are filled
-- **Custom Input**: All dropdown fields support free-text entry for values not in the list
-- **Auto-Scroll**: Selecting a template automatically scrolls to the message input box and populates it
-- **Streaming Display**: Agent responses stream character-by-character for better UX
-
-#### Implementation Files
-- `prompt_manager.py`: Template loading, validation, and rendering logic
-- `prompt_templates.json`: Configuration file with 16 templates and field definitions
-- UI integration in `app.py` with event handlers for category/prompt selection and field validation
+This conversational and Agentic AI application changes the conventional way of Data Governance practices where knowledges/experties are scattered, best practices are non-standardized, changes were untracked, procedures are manual and it requires tremendous effort to pull both systems and human together to achieve trackable governance goals with excellence in documentation. With this application, business rules, DQ knowledges and best practices are all centralized in the mind of the AI system, users with different roles can simply chat with the AI to obtain latest DQ findings and submit various requests for the AI agent to execute securely with the best quality and adherence to the best standard. Furthermore, we leverage AI to help with decision making and complex DQ rule set-up, save us tons of efforts in navigating around different systems, asking for permissions, waiting for approvals to achieve our daily goals. It achieves the harness with an absolute autonomous system and seamless system integration, closing the loop with detailed documentation and long term memory.
 
 ## Capabilities
 
