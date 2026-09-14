@@ -4,6 +4,54 @@ An AI-assisted operations tool for inspecting, diagnosing, and maintaining J&J C
 
 The primary application is intended for a small group of Collibra DQ super-users. It can read live configuration and, after an explicit preview-and-confirm interaction, update dataset definitions, alerts, and business-unit assignments.
 
+## Features
+
+### Pre-Configured Prompt Templates
+
+The chatbot now includes a library of 16 pre-configured prompt templates organized into 6 categories:
+
+**Update Dataset** (6 templates)
+- Business Unit mapping update
+- Email alert configuration
+- Dataset definitions and metadata
+- LinkId updates
+- Data Domain tagging
+- Sub-Domain tagging
+
+**Create Dataset** (2 templates)
+- S3-backed dataset creation
+- Redshift table-backed dataset creation
+
+**Custom Rules** (2 templates)
+- Create new custom DQ rules
+- Update existing custom rules
+
+**JIRA Operations** (3 templates)
+- Query existing JIRA tickets
+- Submit new DQ setup requests
+- Submit DQ change requests
+
+**Query & Inspect** (2 templates)
+- Inspect DQ findings by dataset and time period
+- Inspect DQ configurations and rules
+
+**Information** (1 template)
+- DQ best practices and guidance with 8 predefined topics (customizable)
+
+#### Features
+- **Smart Field Types**: Templates support text, textarea, and dropdown fields with optional lookups to database tables
+- **Dataset Name Lookup**: A "Query" button on dataset_name fields fetches available datasets from `public.dqm_business_unit_mapping`
+- **Dynamic Form Rendering**: Forms hide/show and auto-populate based on selected template
+- **Required Field Validation**: Submit button enables only when all required fields are filled
+- **Custom Input**: All dropdown fields support free-text entry for values not in the list
+- **Auto-Scroll**: Selecting a template automatically scrolls to the message input box and populates it
+- **Streaming Display**: Agent responses stream character-by-character for better UX
+
+#### Implementation Files
+- `prompt_manager.py`: Template loading, validation, and rendering logic
+- `prompt_templates.json`: Configuration file with 16 templates and field definitions
+- UI integration in `app.py` with event handlers for category/prompt selection and field validation
+
 ## Capabilities
 
 ### Collibra DQ inspection
@@ -325,6 +373,115 @@ finally:
 | Atlassian tools are unavailable | Check the MCP URL and Atlassian headers; the chatbot can still operate with local Collibra tools. |
 | A proposed change cannot be applied | The `change_id` may have expired, already been consumed, or been generated in a different process. Propose the change again. |
 | Port 7860 is occupied | Stop the process listening on the port or change the `demo.launch` port in `collibra_dq_app/app.py`. |
+
+## Pre-Configured Prompt Templates
+
+The chatbot includes a library of 16 pre-configured prompt templates organized into 6 categories to help users quickly construct complex requests:
+
+### Template Categories
+
+**Update Dataset** (6 templates)
+- Business Unit mapping update
+- Email alert configuration
+- Dataset definitions and metadata
+- LinkId updates
+- Data Domain tagging
+- Sub-Domain tagging
+
+**Create Dataset** (2 templates)
+- S3-backed dataset creation
+- Redshift table-backed dataset creation
+
+**Custom Rules** (2 templates)
+- Create new custom DQ rules
+- Update existing custom rules
+
+**JIRA Operations** (3 templates)
+- Query existing JIRA tickets
+- Submit new DQ setup requests
+- Submit DQ change requests
+
+**Query & Inspect** (2 templates)
+- Inspect DQ findings by dataset and time period
+- Inspect DQ configurations and rules
+
+**Information** (1 template)
+- DQ best practices and guidance with 8 predefined topics (customizable)
+
+### Features
+
+- **Smart Field Types**: Templates support text, textarea, and dropdown fields
+- **Database Lookups**: Dataset name fields include a "Query" button to fetch available datasets from `public.dqm_business_unit_mapping`
+- **Dynamic Form Rendering**: Forms automatically show/hide fields based on the selected template
+- **Required Field Validation**: Submit button enables only when all required fields are filled
+- **Custom Input Support**: All dropdown fields allow free-text entry for values not in the list
+- **Auto-Scroll**: After selecting a template, the UI automatically scrolls to the message input box
+- **Streaming Display**: Agent responses stream character-by-character for a progressive text effect
+
+### Implementation Details
+
+**New Files:**
+- `prompt_manager.py`: Core template system with PromptTemplate and PromptTemplateManager classes
+- `prompt_templates.json`: Configuration file with 16 templates and field definitions
+
+**UI Integration (app.py):**
+- Category and prompt selection with auto-population of choices
+- Dynamic field rendering for up to 8 fields per template
+- Real-time field validation with button state management
+- Query buttons for dataset name fields with database lookup
+- JavaScript-based auto-scroll after prompt selection
+- Streaming text display with configurable chunk size and delay
+
+**Database Integration:**
+- Prompt system queries PostgreSQL for dynamic field options
+- Uses existing `postgres_io.py` infrastructure
+- Graceful fallback if database is unavailable
+
+### Usage
+
+1. Select a **Category** from the dropdown
+2. Select a **Prompt** from the populated choices (or type a custom prompt)
+3. If a template was selected, fill in the required fields (marked with `*`)
+4. Use the **Query** button for dataset name fields to auto-populate from the database
+5. Click **Use This Prompt** to populate the message box
+6. Review and modify the generated prompt if needed
+7. Click **Submit** to send to the agent
+
+## Local Development Setup
+
+### Environment Variables
+
+```bash
+# Login credentials allowlist
+export SUPERUSER_CREDENTIALS="username:password,alice:secret123"
+
+# GenAI Gateway
+export JNJ_GENAI_API_KEY=your_key
+
+# Collibra DQ API (at least one region)
+export CDQ_BASE_URL_APAC=https://cdq.example.com
+export CDQ_USERNAME_APAC=your_username
+export CDQ_PASSWORD_APAC=your_password
+
+# PostgreSQL for business unit mapping and chat history
+export DB_HOST=postgres.example.com
+export DB_PORT=5432
+export DB_NAME=your_database
+export DB_USER=db_user
+export DB_PASSWORD=db_password
+export DB_SSLMODE=require
+export DQM_BU_MAPPING_TABLE=public.dqm_business_unit_mapping
+export DQM_CHAT_HISTORY_TABLE=public.dqm_chatbot_chat_history
+export DQM_CHANGE_HISTORY_TABLE=public.dqm_chatbot_change_history
+```
+
+### Running
+
+```bash
+cd collibra_dq_app
+python app.py
+# Open http://127.0.0.1:7860 in your browser
+```
 
 ## Testing and development status
 
