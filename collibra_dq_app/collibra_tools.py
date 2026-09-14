@@ -1657,6 +1657,105 @@ def propose_alert_update(
         "message": "Review with the user. Call apply_dataset_change(change_id) only after they confirm.",
     }
 
+
+@tool
+def get_dataset_change_history(
+    dataset: str,
+    region: str = "",
+    change_category: str = "",
+    since_days: int = 0,
+    limit: int = 200,
+) -> dict[str, Any]:
+    """Retrieve the audit trail of changes previously applied to a dataset through this
+    chatbot (custom rules, profile settings, dataset definition fields, email alerts,
+    business units). Returns aggregated counts plus the changes grouped into batches
+    (one batch per apply, i.e. same user + reason + timestamp).
+
+    Summarize the result for the user in plain language -- e.g. "3 changes over 2 sessions:
+    on 2026-03-01 alice raised the scheduleTime and added rule X because ..." -- instead of
+    dumping every row. Only list individual field-level before/after values when the user
+    asks for detail or when the change count is small.
+
+    Args:
+        dataset: Exact Collibra DQ dataset name.
+        region: Optional "apac" or "cn" filter; empty means all regions.
+        change_category: Optional filter, e.g. "Custom Rule", "Profile Setting",
+            "Dataset Definition", "Email Alert", "Business Unit".
+        since_days: Only include changes from the last N days; 0 means no time limit.
+        limit: Maximum number of rows to retrieve (default 200, max 1000).
+    """
+    try:
+        rows = chat_store.get_change_history(
+            dataset=dataset,
+            region=region or None,
+            change_category=change_category or None,
+            since_days=since_days or None,
+            limit=limit,
+        )
+    except Exception as exc:
+        return {"dataset": dataset, "error": f"Could not read change history: {exc}"}
+
+    if not rows:
+        return {
+            "dataset": dataset,
+            "region": region or "all",
+            "total_changes": 0,
+            "message": "No change history recorded for this dataset.",
+        }
+
+    by_category: dict[str, int] = {}
+    by_user: dict[str, int] = {}
+    sessions: set[str] = set()
+    batches: dict[tuple, dict[str, Any]] = {}
+    for row in rows:
+        category = row.get("change_category") or "Unknown"
+        user = row.get("change_by") or "unknown"
+        by_category[category] = by_category.get(category, 0) + 1
+        by_user[user] = by_user.get(user, 0) + 1
+        if row.get("session_id"):
+            sessions.add(row["session_id"])
+        changed_at = row.get("changed_at")
+        key = (str(changed_at), user, row.get("change_reason") or "")
+        batch = batches.setdefault(
+            key,
+            {
+                "changed_at": str(changed_at),
+                "change_by": user,
+                "change_reason": row.get("change_reason"),
+                "session_id": row.get("session_id"),
+                "region": row.get("region"),
+                "dataset_category": row.get("dataset_category"),
+                "changes": [],
+            },
+        )
+        batch["changes"].append(
+            {
+                "change_category": category,
+                "change_item": row.get("change_item"),
+                "change_from": row.get("change_from"),
+                "change_to": row.get("change_to"),
+            }
+        )
+
+    timestamps = [str(row.get("changed_at")) for row in rows]
+    return {
+        "dataset": dataset,
+        "region": region or "all",
+        "total_changes": len(rows),
+        "truncated": len(rows) >= min(max(1, int(limit or 200)), 1000),
+        "first_change_at": timestamps[-1],
+        "last_change_at": timestamps[0],
+        "distinct_sessions": len(sessions),
+        "changes_by_category": by_category,
+        "changes_by_user": by_user,
+        "batches": list(batches.values()),
+        "instruction": (
+            "Summarize these changes for the user: what was changed, when, by whom, and why. "
+            "Group related edits together rather than listing every row verbatim."
+        ),
+    }
+
+
 ALL_TOOLS = [
     apply_dataset_change,
     check_link_id_uniqueness,
@@ -1664,6 +1763,7 @@ ALL_TOOLS = [
     find_similar_tagged_datasets,
     get_business_unit,
     get_dataset_alert,
+    get_dataset_change_history,
     get_dataset_definition,
     get_dataset_rules,
     get_dq_findings,
