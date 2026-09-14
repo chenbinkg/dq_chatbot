@@ -245,6 +245,27 @@ APP_CSS = """
 }
 """
 
+# The multi-line message box swallows Enter, so bind it to the Submit button
+# (Shift+Enter still inserts a newline).
+ENTER_TO_SUBMIT_JS = """
+() => {
+    const bind = () => {
+        const textarea = document.querySelector('#msg_box_wrap textarea');
+        if (!textarea || textarea.dataset.enterSubmitBound) return;
+        textarea.dataset.enterSubmitBound = '1';
+        textarea.addEventListener('keydown', (event) => {
+            if (event.key !== 'Enter' || event.shiftKey || event.isComposing) return;
+            event.preventDefault();
+            event.stopPropagation();
+            const btn = document.querySelector('#msg_send_btn');
+            if (btn && !btn.disabled) btn.click();
+        }, true);
+    };
+    bind();
+    new MutationObserver(bind).observe(document.body, { childList: true, subtree: true });
+}
+"""
+
 
 with gr.Blocks(title="Collibra DQ Chatbot") as demo:
     gr.Markdown("# Collibra DQ Chatbot")
@@ -761,6 +782,7 @@ with gr.Blocks(title="Collibra DQ Chatbot") as demo:
             return gr.update(choices=[], value=None)
         
         demo.load(on_page_load, None, [prompt_title])
+        demo.load(None, None, None, js=ENTER_TO_SUBMIT_JS)
         
         clear.click(lambda: [], None, chatbot, queue=False)
 
