@@ -88,7 +88,7 @@ def _tool_input_text(tool_input) -> str:
     return f"```json\n{text[:2000]}\n```"
 
 
-def _display_chunks(text: str, size: int = 6):
+def _display_chunks(text: str, size: int = 12):
     for start in range(0, len(text), size):
         yield text[start:start + size]
 
@@ -610,7 +610,7 @@ with gr.Blocks(title="Collibra DQ Chatbot") as demo:
                             result_text += chunk
                             chat_history[answer_index]["content"] = result_text
                             yield chat_history, ""
-                            await asyncio.sleep(0.03)
+                            await asyncio.sleep(0.005)
 
                 complete_active_tools()
                 chat_history[invocation_index]["content"] = "Completed."
