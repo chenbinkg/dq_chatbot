@@ -34,6 +34,7 @@ from collibra_dq_client import CollibraDQClient
 import redshift_connections
 import bu_mapping_reference
 import dataset_builder
+import dataset_definitions_reference
 import business_unit
 import chat_store
 from jira_logger import (
@@ -104,6 +105,25 @@ SUBDOMAIN_CODES = {
     "PRO": "Product (Brand, Product Codes, TA, DA)",
     "SAL": "Sales (Sales Amount)",
 }
+
+# Adaptive rule metric types accepted by /v2/set-boundary-suppress. NULL/EMPTY/
+# CARDINALITY/MEAN VALUE/MIN VALUE/MAX VALUE/DATA_TYPE are tied to a real column name
+# (CARDINALITY == "Uniqueness" in the broader adaptive rule terminology). ROW_COUNT and
+# TIME are dataset-level and are tied to the generic pseudo-column names "Row Count" and
+# "Load Time" respectively (not a real column).
+BOUNDARY_SUPPRESS_COLUMN_METRIC_TYPES = [
+    "NULL",
+    "EMPTY",
+    "CARDINALITY",
+    "MEAN VALUE",
+    "MIN VALUE",
+    "MAX VALUE",
+    "DATA_TYPE",
+]
+BOUNDARY_SUPPRESS_DATASET_METRIC_TYPES = ["ROW_COUNT", "TIME"]
+BOUNDARY_SUPPRESS_METRIC_TYPES = BOUNDARY_SUPPRESS_COLUMN_METRIC_TYPES + BOUNDARY_SUPPRESS_DATASET_METRIC_TYPES
+BOUNDARY_SUPPRESS_GENERIC_ITEM_NAMES = {"ROW_COUNT": "Row Count", "TIME": "Load Time"}
+
 
 
 def _get_client(region: str = "apac") -> CollibraDQClient:
@@ -1024,6 +1044,40 @@ def get_dataset_rules(dataset: str, region: str = "apac") -> list[dict[str, Any]
 
 
 @tool
+def get_dataset_adaptive_rule_definitions(dataset: str) -> dict[str, Any]:
+    """Query public.dqm_dataset_definitions for the detailed adaptive rule configuration
+    of one dataset -- one row per source column, with which adaptive checks are enabled
+    (Data Type Check, Schema Change, Dupes, Custom Rules, Null Values, Empty Fields,
+    Uniqueness, Min, Max, Mean, Outliers, Shapes, Patterns), plus dataset-level fields
+    (Run Id, Link Id, Date Filter, Scheduler, business unit info) returned once under
+    dataset_info. Read-only. Use this instead of get_dataset_definition when you need the
+    per-column adaptive rule/check breakdown rather than the raw DatasetDef JSON.
+
+    Show the user the full per-column table (col_name, Data Type, Row Count, Execution
+    Time, Data Type Check, Schema Change, Dupes, Custom Rules, Null Values, Empty Fields,
+    Uniqueness, Min, Max, Mean, Outliers, Shapes, Patterns) for every column returned --
+    do not collapse it into an aggregate summary unless the user only asked for one.
+
+    Args:
+        dataset: Exact Collibra DQ dataset name.
+    """
+    result = dataset_definitions_reference.get_dataset_definitions(dataset)
+    if not result["columns"]:
+        return {"dataset": dataset, "dataset_info": {}, "columns": [], "message": "No dataset definitions found for this dataset."}
+    return {
+        "dataset": dataset,
+        "dataset_info": result["dataset_info"],
+        "columns": result["columns"],
+        "instruction": (
+            "Present 'columns' as a full table, one row per column, listing col_name, Data "
+            "Type, Row Count, Execution Time, Data Type Check, Schema Change, Dupes, Custom "
+            "Rules, Null Values, Empty Fields, Uniqueness, Min, Max, Mean, Outliers, Shapes, "
+            "Patterns for every column -- do not summarize into aggregate counts only."
+        ),
+    }
+
+
+@tool
 def validate_rule_run(dataset: str, rule_nm: str, run_date: str, region: str = "apac") -> dict[str, Any]:
     """Check whether one custom rule passed on a specific job run (GET
     /v3/jobs/{dataset}/{run_date}/findings, then looks up rule_nm in the "rules" list).
@@ -1350,6 +1404,84 @@ def propose_rule_change(
 
 
 @tool
+def propose_boundary_suppress(
+    dataset: str,
+    run_id: str,
+    items: list[str],
+    metric_type: str,
+    suppress: int = 1,
+    retrain: str = "true",
+    region: str = "apac",
+) -> dict[str, Any]:
+    """Preview suppressing or unsuppressing one adaptive rule metric (POST
+    /v2/set-boundary-suppress), across one or many columns of the same dataset run in a
+    single proposal. This does NOT write anything -- it returns one change_id covering the
+    whole batch. Show it to the user and only call apply_dataset_change after they
+    explicitly confirm. Unlike other apply_dataset_change actions, this does not trigger a
+    job run -- it takes effect immediately once applied.
+
+    Always pass every column the user wants changed in one call via `items` (e.g. all 25
+    columns at once) rather than calling this tool once per column -- proposing/applying
+    one column at a time on a large batch generates a separate diff and apply result for
+    each, which can exceed the model's per-turn output token limit. Batching keeps it to
+    one propose + one apply for the whole batch.
+
+    `metric_type` must be one of NULL, EMPTY, CARDINALITY, MEAN VALUE, MIN VALUE,
+    MAX VALUE, DATA_TYPE (CARDINALITY is the same as "Uniqueness" in adaptive rule
+    terminology) -- these are tied to real column names, so `items` must be those columns'
+    names. Or ROW_COUNT / TIME, which are dataset-level and use the fixed generic single
+    item "Row Count" / "Load Time" respectively, not a real column name -- for those,
+    `items` must be exactly that one value.
+
+    Args:
+        dataset: Exact Collibra DQ dataset name.
+        run_id: The job run date/id this suppress applies to, e.g. "2026-09-15".
+        items: Column names for column-level metric types (one or many), or exactly
+            ["Row Count"]/["Load Time"] for ROW_COUNT/TIME.
+        metric_type: One of NULL, EMPTY, CARDINALITY, MEAN VALUE, MIN VALUE, MAX VALUE,
+            DATA_TYPE, ROW_COUNT, TIME.
+        suppress: 1 to suppress, 0 to unsuppress. Defaults to 1.
+        retrain: Whether to retrain the adaptive rule boundary. Defaults to "true".
+        region: "apac" or "cn".
+    """
+    metric_type = (metric_type or "").strip()
+    if metric_type not in BOUNDARY_SUPPRESS_METRIC_TYPES:
+        raise ValueError(f"metric_type must be one of {BOUNDARY_SUPPRESS_METRIC_TYPES}, got '{metric_type}'.")
+    if suppress not in (0, 1):
+        raise ValueError(f"suppress must be 0 or 1, got {suppress!r}.")
+    items = [i for i in (items or []) if i]
+    if not items:
+        raise ValueError("items must contain at least one column name (or the fixed ROW_COUNT/TIME item).")
+
+    expected_item = BOUNDARY_SUPPRESS_GENERIC_ITEM_NAMES.get(metric_type)
+    if expected_item and items != [expected_item]:
+        raise ValueError(f"metric_type '{metric_type}' requires items=['{expected_item}'], got {items!r}.")
+
+    payload = {
+        "dataset": dataset,
+        "runId": run_id,
+        "items": items,
+        "metricType": metric_type,
+        "suppress": suppress,
+        "retrain": retrain,
+    }
+    change_id = _stash_change("boundary_suppress", region, dataset, payload, "")
+
+    action_word = "Suppress" if suppress == 1 else "Unsuppress"
+    return {
+        "change_id": change_id,
+        "dataset": dataset,
+        "region": region,
+        "summary": (
+            f"{action_word} adaptive rule metric '{metric_type}' on {len(items)} item(s) "
+            f"for run '{run_id}' (retrain={retrain}): {', '.join(items)}."
+        ),
+        "payload": payload,
+        "message": "Review with the user. Call apply_dataset_change(change_id) only after they confirm.",
+    }
+
+
+@tool
 def apply_dataset_change(change_id: str, change_reason: str) -> dict[str, Any]:
     """Execute a previously proposed dataset create/update after the user has confirmed
     it in chat. Only call this after showing the diff and receiving explicit confirmation.
@@ -1546,7 +1678,51 @@ def apply_dataset_change(change_id: str, change_reason: str) -> dict[str, Any]:
         outcome["jira_change_pending"] = log_result["jira_pending"]
         return outcome
 
+    # Suppress/unsuppress an adaptive rule metric across one or many items in one call.
+    # Takes effect immediately -- no job run.
+    elif change["action"] == "boundary_suppress":
+        payload = change["payload"]
+        results: dict[str, Any] = {}
+        errors: dict[str, str] = {}
+        for item in payload["items"]:
+            try:
+                results[item] = client.set_boundary_suppress(
+                    dataset=payload["dataset"],
+                    run_id=payload["runId"],
+                    item=item,
+                    metric_type=payload["metricType"],
+                    suppress=payload["suppress"],
+                    retrain=payload["retrain"],
+                )
+            except Exception as exc:
+                errors[item] = str(exc)
+        outcome = {
+            "status": "applied" if not errors else "partially applied",
+            "action": "boundary_suppress",
+            "dataset": dataset,
+            "results": results,
+        }
+        if errors:
+            outcome["errors"] = errors
+        action_word = "Suppress" if payload["suppress"] == 1 else "Unsuppress"
+        state_before = "Suppressed" if payload["suppress"] == 0 else "Unsuppressed"
+        state_after = "Suppressed" if payload["suppress"] == 1 else "Unsuppressed"
+        entries = [
+            ("Adaptive rule", f"{item}.{payload['metricType']}", state_before, state_after)
+            for item in payload["items"]
+            if item not in errors
+        ]
+        log_result = _log_change_entries(dataset, region, "Existing", entries, change_reason)
+        outcome["change_logged_to_database"] = log_result["db_logged"]
+        outcome["jira_change_pending"] = log_result["jira_pending"]
+        outcome["message"] = (
+            f"{action_word}ed adaptive rule metric '{payload['metricType']}' on "
+            f"{len(entries)}/{len(payload['items'])} item(s): {', '.join(payload['items'])}."
+        )
+        return outcome
+
     return outcome
+
 
 
 @tool
@@ -1762,6 +1938,7 @@ ALL_TOOLS = [
     data_domain_distribution,
     find_similar_tagged_datasets,
     get_business_unit,
+    get_dataset_adaptive_rule_definitions,
     get_dataset_alert,
     get_dataset_change_history,
     get_dataset_definition,
@@ -1775,6 +1952,7 @@ ALL_TOOLS = [
     list_s3_objects,
     list_template_rules,
     propose_alert_update,
+    propose_boundary_suppress,
     propose_business_unit_assignment,
     propose_dataset_update,
     propose_email_alert,
