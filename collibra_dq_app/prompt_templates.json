@@ -130,6 +130,70 @@
       ]
     },
     {
+      "id": "update_boundary_suppress",
+      "category": "Update Dataset",
+      "title": "Suppress/Unsuppress Adaptive Rule",
+      "description": "for one or many columns",
+      "template": "I want to update the adaptive rule suppression for dataset '{dataset_name}'. Run Id: '{run_id}'. Column(s)/Item(s): '{item}'. Metric type: '{metric_type}'. Suppress: '{suppress}'. Retrain: '{retrain}'.",
+      "fields": [
+        {
+          "name": "dataset_name",
+          "label": "Dataset Name",
+          "type": "dropdown",
+          "required": true,
+          "placeholder": "e.g., ds_conn_s3_x",
+          "lookup": "datasets",
+          "options": []
+        },
+        {
+          "name": "run_id",
+          "label": "Run Id",
+          "type": "text",
+          "required": true,
+          "placeholder": "e.g., 2026-09-15"
+        },
+        {
+          "name": "item",
+          "label": "Column Name(s) / Item",
+          "type": "text",
+          "required": true,
+          "placeholder": "Comma-separated column names, or 'Row Count'/'Load Time' for ROW_COUNT/TIME"
+        },
+        {
+          "name": "metric_type",
+          "label": "Metric Type",
+          "type": "dropdown",
+          "required": true,
+          "placeholder": "Select a metric type",
+          "options": [
+            "NULL",
+            "EMPTY",
+            "CARDINALITY",
+            "MEAN VALUE",
+            "MIN VALUE",
+            "MAX VALUE",
+            "DATA_TYPE",
+            "ROW_COUNT",
+            "TIME"
+          ]
+        },
+        {
+          "name": "suppress",
+          "label": "Suppress (1) / Unsuppress (0)",
+          "type": "text",
+          "required": true,
+          "placeholder": "1"
+        },
+        {
+          "name": "retrain",
+          "label": "Retrain",
+          "type": "text",
+          "required": true,
+          "placeholder": "true"
+        }
+      ]
+    },
+    {
       "id": "create_s3_dataset",
       "category": "Create Dataset",
       "title": "Create New S3 Dataset",
@@ -251,7 +315,7 @@
           "label": "JIRA Project",
           "type": "text",
           "required": true,
-          "placeholder": "e.g., ANGen, iDiscover Regional MDM, iDiscover Data Quality"
+          "placeholder": "e.g., JEJQ (ANGen), JGPV (DQ), JEKB (MDM)"
         },
         {
           "name": "status",
@@ -383,6 +447,24 @@
       "title": "Inspect DQ Configurations",
       "description": "Review dataset configuration and metadata",
       "template": "I want to inspect the DQ configurations for dataset '{dataset_name}'.",
+      "fields": [
+        {
+          "name": "dataset_name",
+          "label": "Dataset Name",
+          "type": "dropdown",
+          "required": true,
+          "placeholder": "e.g., ds_conn_s3_x",
+          "lookup": "datasets",
+          "options": []
+        }
+      ]
+    },
+    {
+      "id": "inspect_adaptive_rule_definitions",
+      "category": "Query & Inspect",
+      "title": "Inspect Adaptive Rule Definitions",
+      "description": "Review the detailed per-column adaptive rule configuration for a dataset",
+      "template": "I want to inspect the detailed adaptive rule definitions for dataset '{dataset_name}'.",
       "fields": [
         {
           "name": "dataset_name",
