@@ -20,6 +20,7 @@ The local agent can query either the `apac` or `cn` CDQ deployment to:
 - Resolve a dataset's business-unit mapping and parse its market, project, and CDE status.
 - List available business units, active DQ rules, and the live metaTag catalog.
 - Retrieve DQ findings for a dataset and run date, and check whether a single rule passed on a given run (`validate_rule_run`) after a `ruleValue` change.
+- Retrieve dataset definition table from postgres table `public.dqm_dataset_definitions` produced by automation pipeline
 
 ### Dataset and metadata assistance
 
@@ -57,6 +58,7 @@ Supported write workflows include:
 - Configure the standard `Low Dataset Score` email alert.
 - Create or update a business-unit definition and attach it to a dataset.
 - Trigger a job run after a DatasetDef update, custom rule change, or new dataset creation.
+- Suppress or unsuppress adaptive rule metric across one or many columns of the same dataset run, no job triggered.
 
 New dataset creation applies repository-defined defaults: a Monday-Friday daily schedule in `Asia/Singapore`, standard Spark sizing, selected profiling checks, shape/outlier/pattern layers disabled, and duplicate checking enabled for Redshift datasets with a supplied `linkId`. The tool reports best-practice violations before anything is written.
 
@@ -96,6 +98,7 @@ Strands Agent (collibra_dq_app/dq_agent.py)
 | `collibra_dq_app/collibra_tools.py` | Strands tool definitions, read/write workflows, previews, and confirmation enforcement. |
 | `collibra_dq_app/collibra_dq_client.py` | Low-level authenticated Collibra CDQ REST client. |
 | `collibra_dq_app/dataset_builder.py` | DatasetDef cloning, source-specific payload construction, validation, and alert defaults. |
+| `collibra_dq_app/dataset_definitions_reference.py` | Lookups against `public.dqm_dataset_definitions` in PostgreSQL. |
 | `collibra_dq_app/redshift_connections.py` | Static connection registry, cluster detection, S3 parsing, table sampling, and key uniqueness checks. |
 | `collibra_dq_app/business_unit.py` | Business-unit hierarchy parsing and market/project inference. |
 | `collibra_dq_app/bu_mapping_reference.py` | Similarity-ranked lookups against the curated PostgreSQL mapping table. |
@@ -133,7 +136,7 @@ python -m pip install --upgrade pip
 python -m pip install -r collibra_dq_app/requirements.txt
 ```
 
-The repository does not currently include a `.env.example`. Create a local `.env` file or export variables in the shell. `.env` is ignored by Git.
+The repository includes a `.env.example`. Create a local `.env` file or export variables in the shell. `.env` is ignored by Git.
 
 ## Configuration
 
@@ -336,13 +339,14 @@ The chatbot includes a library of 16 pre-configured prompt templates organized i
 
 ### Template Categories
 
-**Update Dataset** (6 templates)
+**Update Dataset** (7 templates)
 - Business Unit mapping update
 - Email alert configuration
 - Dataset definitions and metadata
 - LinkId updates
 - Data Domain tagging
 - Sub-Domain tagging
+- Update adaptive rule boundary suppress
 
 **Create Dataset** (2 templates)
 - S3-backed dataset creation
@@ -357,9 +361,10 @@ The chatbot includes a library of 16 pre-configured prompt templates organized i
 - Submit new DQ setup requests
 - Submit DQ change requests
 
-**Query & Inspect** (2 templates)
+**Query & Inspect** (3 templates)
 - Inspect DQ findings by dataset and time period
 - Inspect DQ configurations and rules
+- Inspect adaptive rule definitions
 
 **Information** (1 template)
 - DQ best practices and guidance with 8 predefined topics (customizable)
