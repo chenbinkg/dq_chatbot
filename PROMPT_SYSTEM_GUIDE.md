@@ -109,13 +109,14 @@ The chatbot UI now supports **pre-configured prompts** that allow users to quick
 
 ## Current Prompt Categories & Prompts
 
-### Update Dataset (6 prompts)
+### Update Dataset (7 prompts)
 - Update Business Unit
 - Update Email Alert
 - Update Dataset Definitions
 - Update LinkId
 - Update Data Domain Tagging
 - Update Sub-Domain Tagging
+- Update adaptive rule boundary suppress
 
 ### Create Dataset (2 prompts)
 - Create New S3 Dataset
@@ -130,9 +131,10 @@ The chatbot UI now supports **pre-configured prompts** that allow users to quick
 - Submit DQ JIRA Ticket (New DQ Setup)
 - Submit DQ JIRA Ticket (Change Request)
 
-### Query & Inspect (2 prompts)
+### Query & Inspect (3 prompts)
 - Inspect DQ Findings
 - Inspect DQ Configurations
+- Inspect adaptive rule definitions
 
 ### Information (1 prompt)
 - DQ Best Practices
