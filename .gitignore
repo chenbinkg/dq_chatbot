@@ -9,3 +9,5 @@ __pycache__
 *.pyc
 *data
 *outputs
+*.ipynb
+*.ipynb_checkpoints
