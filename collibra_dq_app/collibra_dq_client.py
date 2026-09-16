@@ -181,6 +181,31 @@ class CollibraDQClient:
         """POST /v3/jobs/run to trigger a dataset run so a new definition takes effect."""
         return self._request("POST", "/v3/jobs/run", params={"dataset": dataset, "runDate": run_date})
 
+    def set_boundary_suppress(
+        self,
+        dataset: str,
+        run_id: str,
+        item: str,
+        metric_type: str,
+        suppress: int,
+        retrain: str = "true",
+    ) -> dict[str, Any]:
+        """POST /v2/set-boundary-suppress to suppress/unsuppress an adaptive rule metric
+        (e.g. NULL/EMPTY/CARDINALITY/... for a column, or ROW_COUNT/TIME) for a dataset run.
+        Does not trigger a job run -- takes effect immediately."""
+        return self._request(
+            "POST",
+            "/v2/set-boundary-suppress",
+            params={
+                "dataset": dataset,
+                "runId": run_id,
+                "item": item,
+                "metricType": metric_type,
+                "suppress": suppress,
+                "retrain": retrain,
+            },
+        )
+
     # ------------------------------------------------------------------
     # Write: custom rules
     # ------------------------------------------------------------------
