@@ -74,7 +74,11 @@ def _require_strands() -> None:
 
 
 def get_model(**overrides: Any) -> JNJClaudeGatewayModel:
-    """Build the J&J GenAI Gateway model provider used by the agent."""
+    """Build the J&J GenAI Gateway model provider used by the agent. Defaults to a higher
+    max_tokens than JNJClaudeGatewayModel's own default (4096) -- this agent's tool
+    results/replies (e.g. per-column adaptive rule tables, batched apply outcomes) can be
+    large enough to hit that ceiling mid-generation (MaxTokensReachedException)."""
+    overrides.setdefault("max_tokens", 8192)
     return JNJClaudeGatewayModel(**overrides)
 
 
