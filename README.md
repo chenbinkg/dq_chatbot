@@ -2,7 +2,7 @@
 
 An AI-assisted operations tool for inspecting, diagnosing, and maintaining J&J Collibra Data Quality (CDQ) dataset definitions. The repository combines a local Gradio chat application, a Strands agent, a custom J&J GenAI Gateway model provider, direct Collibra DQ REST tools, Redshift inspection helpers, curated business-unit lookups, and additional Atlassian MCP tools for JIRA operations.
 
-It features a pre-configured prompt generation with 16 templates of frequently used DQ queries. It can read live configuration and, after an explicit preview-and-confirm interaction, update dataset definitions, alerts, and business-unit assignments.
+It features a pre-configured prompt generation with 18 templates of frequently used DQ queries. It can read live configuration and, after an explicit preview-and-confirm interaction, update dataset definitions, alerts, and business-unit assignments.
 
 The original application is intended for a small group of Collibra DQ super-users.  After the infra is set up with authentications, the chatbot can be released to a larger group of people who have collaboration works with Data Quality team, including Data Stewards, Tech Owners and Data Owners.
 
