@@ -126,8 +126,16 @@ BOUNDARY_SUPPRESS_GENERIC_ITEM_NAMES = {"ROW_COUNT": "Row Count", "TIME": "Load 
 
 
 
+def _resolve_region(region: str = "") -> str:
+    ctx = chat_store.get_session_context()
+    session_region = (ctx.get("region") or "").strip().lower()
+    if ctx.get("session_id") and session_region:
+        return session_region
+    return (region or session_region or "apac").strip().lower()
+
+
 def _get_client(region: str = "apac") -> CollibraDQClient:
-    region = (region or "apac").strip().lower()
+    region = _resolve_region(region)
     if region not in _clients:
         base_url = os.getenv(f"CDQ_BASE_URL_{region.upper()}")
         username = os.getenv(f"CDQ_USERNAME_{region.upper()}")
@@ -137,6 +145,7 @@ def _get_client(region: str = "apac") -> CollibraDQClient:
 
 
 def _stash_change(action: str, region: str, dataset: str, payload: dict[str, Any], diff: str) -> str:
+    region = _resolve_region(region)
     change_id = uuid.uuid4().hex[:8]
     _pending_changes[change_id] = {
         "action": action,
@@ -170,6 +179,7 @@ def _diff_summary(before: dict[str, Any], after: dict[str, Any]) -> str:
 
 def _find_pending_update(region: str, dataset: str) -> Optional[str]:
     """Return the change_id of an unexpired pending 'update' proposal for this dataset, if any."""
+    region = _resolve_region(region)
     now = time.time()
     for cid, change in _pending_changes.items():
         if (
@@ -188,6 +198,7 @@ def _propose_update(region: str, dataset: str, patch: dict[str, Any]) -> dict[st
     propose_profile_settings_update calls followed by a single apply_dataset_change results
     in exactly one PUT + one run_job, not one per proposal.
     """
+    region = _resolve_region(region)
     client = _get_client(region)
     existing_id = _find_pending_update(region, dataset)
 
@@ -411,6 +422,7 @@ def _log_change_entries(
 
 def _find_pending_rule_change(region: str, dataset: str) -> Optional[str]:
     """Return the change_id of an unexpired pending 'upsert_rule' change for this dataset, if any."""
+    region = _resolve_region(region)
     now = time.time()
     for cid, change in _pending_changes.items():
         if (
@@ -691,6 +703,7 @@ def _normalize_name_part(value: str) -> str:
 
 
 def _existing_dataset_names(region: str) -> set[str]:
+    region = _resolve_region(region)
     raw = _get_client(region).list_datasets() or []
     names = set()
     for item in raw:
@@ -1180,6 +1193,7 @@ def propose_dataset_update(
     if not patch:
         raise ValueError("No fields provided to update.")
 
+    region = _resolve_region(region)
     result = _propose_update(region, dataset, patch)
     return {
         "change_id": result["change_id"],
@@ -1249,6 +1263,7 @@ def propose_profile_settings_update(
     if not settings:
         raise ValueError("No profile settings provided to update.")
 
+    region = _resolve_region(region)
     existing_id = _find_pending_update(region, dataset)
     if existing_id:
         current_profile = _pending_changes[existing_id]["payload"].get("profile") or {}
@@ -1338,6 +1353,7 @@ def propose_rule_change(
     if not rule_nm:
         raise ValueError("rule_payload must include 'ruleNm'.")
 
+    region = _resolve_region(region)
     client = _get_client(region)
     existing_rules = client.get_rules_for_dataset(dataset) or []
     lookup_nm = old_rule_nm or rule_nm
@@ -1444,6 +1460,7 @@ def propose_boundary_suppress(
         retrain: Whether to retrain the adaptive rule boundary. Defaults to "true".
         region: "apac" or "cn".
     """
+    region = _resolve_region(region)
     metric_type = (metric_type or "").strip()
     if metric_type not in BOUNDARY_SUPPRESS_METRIC_TYPES:
         raise ValueError(f"metric_type must be one of {BOUNDARY_SUPPRESS_METRIC_TYPES}, got '{metric_type}'.")
@@ -1744,6 +1761,7 @@ def sync_jira_change_request(dataset: str, region: str, market: str) -> dict[str
             version/fixVersion (there is no per-dataset version), so this is required to
             attach the ticket to the right market.
     """
+    region = _resolve_region(region)
     key = (region, dataset)
     batches = _pending_jira_batches.pop(key, [])
     if not batches:
@@ -1791,6 +1809,7 @@ def propose_email_alert(dataset: str, region: str = "apac") -> dict[str, Any]:
         # alert_email: Email address (or comma-separated addresses) to receive DQ alerts.
         region: "apac" or "cn".
     """
+    region = _resolve_region(region)
     existing_alert = _get_client(region).get_alert_dataset(dataset)
     if not existing_alert:
         alert_payload = dataset_builder.build_alert_payload(dataset)
@@ -1815,6 +1834,7 @@ def propose_alert_update(
         region: "apac" or "cn".
     """
 
+    region = _resolve_region(region)
     existing_alert = _get_client(region).get_alert_dataset(dataset)
     if alert_payload not in existing_alert:
         change_id = _stash_change("assign_alert", region, dataset, {}, "")
@@ -1860,6 +1880,7 @@ def get_dataset_change_history(
         since_days: Only include changes from the last N days; 0 means no time limit.
         limit: Maximum number of rows to retrieve (default 200, max 1000).
     """
+    region = _resolve_region(region)
     try:
         rows = chat_store.get_change_history(
             dataset=dataset,
