@@ -39,17 +39,29 @@ from strands_agent import get_atlassian_mcp_client
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from postgres_io import build_settings, read_sql
+from collibra_tools import CollibraDQClient
+
+_clients = {}
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
 agent = None  # lazily built after successful login
+agent_region = None
 mcp_client = None
 mcp_status = "Atlassian MCP has not been initialized."
 prompt_manager = PromptTemplateManager()
 
 BU_MAPPING_TABLE = os.getenv("DQM_BU_MAPPING_TABLE", "public.dqm_business_unit_mapping")
 
+def _get_client(region: str = "apac") -> CollibraDQClient:
+    region = (region or "apac").strip().lower()
+    if region not in _clients:
+        base_url = os.getenv(f"CDQ_BASE_URL_{region.upper()}")
+        username = os.getenv(f"CDQ_USERNAME_{region.upper()}")
+        password = os.getenv(f"CDQ_PASSWORD_{region.upper()}")
+        _clients[region] = CollibraDQClient(base_url=base_url, username=username, password=password, region=region)
+    return _clients[region]
 
 def fetch_dataset_names() -> list[str]:
     """Read the known dataset names from the business unit mapping table."""
@@ -120,17 +132,32 @@ def _history_to_agent_messages(conversation_history: list[dict]) -> list[dict]:
     return messages
 
 
-def _build_chat_agent():
+def _build_chat_agent(region: str = "apac"):
     """Build the persistent chat agent with local tools and Atlassian MCP tools."""
-    global mcp_client, mcp_status
+    global mcp_client, mcp_status, agent_region
+    region = (region or "apac").strip().lower()
     try:
         mcp_client = get_atlassian_mcp_client()
         mcp_status = "Atlassian MCP tools are configured; Jira credentials will be validated on the first tool call."
-        return build_agent(mcp_clients=[mcp_client])
+        agent_region = region
+        return build_agent(mcp_clients=[mcp_client], region=region)
     except Exception as exc:
         logger.warning("Atlassian MCP unavailable; starting with local Collibra tools only: %s", exc)
         mcp_status = f"Atlassian MCP unavailable; using local Collibra tools only ({exc})."
-        return build_agent()
+        agent_region = region
+        return build_agent(region=region)
+
+
+def _ensure_chat_agent(region: str = "apac"):
+    global agent, agent_region
+    region = (region or "apac").strip().lower()
+    if agent is not None and agent_region != region:
+        agent.cleanup()
+        agent = None
+        agent_region = None
+    if agent is None:
+        agent = _build_chat_agent(region)
+    return agent
 
 
 def _cleanup_agent():
@@ -153,25 +180,58 @@ def _load_superuser_allowlist() -> dict[str, str]:
     return allowlist
 
 
-def authenticate(username: str, password: str):
-    """Check username/password against the SUPERUSER_CREDENTIALS allowlist."""
+# def authenticate(username: str, password: str):
+#     """Check username/password against the SUPERUSER_CREDENTIALS allowlist."""
+#     allowlist = _load_superuser_allowlist()
+#     if not allowlist:
+#         return "Login disabled: SUPERUSER_CREDENTIALS is not configured on the server.", False, ""
+#     if allowlist.get(username) == password and password:
+#         return f"Logged in as {username}.", True, username
+#     return "Invalid username or password.", False, ""
+
+
+def authenticate(region: str, username: str, password: str):
+    """Check credentials and capture the selected Collibra region."""
+    region = (region or "apac").strip().lower()
+
+    if region not in {"apac", "cn"}:
+        return "Invalid region selected.", False, "", region
+
     allowlist = _load_superuser_allowlist()
+
     if not allowlist:
-        return "Login disabled: SUPERUSER_CREDENTIALS is not configured on the server.", False, ""
+        return (
+            "Login disabled: SUPERUSER_CREDENTIALS is not configured "
+            "on the server.",
+            False,
+            "",
+            region,
+        )
+
     if allowlist.get(username) == password and password:
-        return f"Logged in as {username}.", True, username
-    return "Invalid username or password.", False, ""
+        # Validate that the region configuration exists.
+        _get_client(region)
+
+        return (
+            f"Logged in as {username} using the {region.upper()} region.",
+            True,
+            username,
+            region,
+        )
+
+    return "Invalid username or password.", False, "", region
 
 
-def check_resume(username: str):
+def check_resume(username: str, region: str):
     """After login, look for this user's most recent chat session and, if one exists,
     surface a prompt letting them resume it instead of starting fresh."""
+    region = (region or "apac").strip().lower()
     if not username:
         return gr.update(visible=False), gr.update(visible=False), None
     try:
-        latest = chat_store.get_latest_session(username)
+        latest = chat_store.get_latest_session(username, region=region)
     except Exception:
-        logger.exception("Failed to check for resumable chat history for user %s", username)
+        logger.exception("Failed to check for resumable chat history for user %s in region %s", username, region)
         latest = None
     if not latest or not latest.get("conversation_history"):
         # No history to offer -- make sure a stale agent from an earlier login in this
@@ -180,18 +240,16 @@ def check_resume(username: str):
             agent.messages = []
         return gr.update(visible=False), gr.update(visible=False), None
     message = (
-        f"You have a previous conversation from {latest['updated_at']} "
+        f"You have a previous {region.upper()} conversation from {latest['updated_at']} "
         f"({latest['turn_count']} messages). Resume it?"
     )
     return gr.update(value=message, visible=True), gr.update(visible=True), latest
 
 
 def resume_previous_chat(latest: dict | None):
-    global agent
     if not latest:
         return [], uuid.uuid4().hex, gr.update(visible=False), gr.update(visible=False)
-    if agent is None:
-        agent = _build_chat_agent()
+    _ensure_chat_agent(latest.get("region") or "apac")
     agent.messages = _history_to_agent_messages(latest["conversation_history"])
     return latest["conversation_history"], latest["session_id"], gr.update(visible=False), gr.update(visible=False)
 
@@ -269,9 +327,17 @@ ENTER_TO_SUBMIT_JS = """
 
 with gr.Blocks(title="Collibra DQ Chatbot") as demo:
     gr.Markdown("# Collibra DQ Chatbot")
-    gr.Markdown("Super-user access to inspect and modify Collibra DQ dataset definitions.")
+    gr.Markdown("Inspect and modify Collibra DQ dataset definitions (Disclaimer: AI could be wrong).")
 
     with gr.Tab("Login"):
+        region_input = gr.Dropdown(
+            choices=["apac", "cn"],
+            label="Region",
+            value="apac", # default
+            interactive=True
+        )
+        region_state = gr.State("apac") # store region state in login, used throughout the session
+
         username_input = gr.Textbox(label="Username")
         password_input = gr.Textbox(label="Password", type="password")
         login_button = gr.Button("Login")
@@ -485,18 +551,38 @@ with gr.Blocks(title="Collibra DQ Chatbot") as demo:
             [current_template_state, prompt_form_title, prompt_form_group, field_types_state, prompt_submit] + prompt_field_rows + prompt_field_inputs + prompt_field_dropdowns + prompt_field_labels + prompt_field_query_btns
         )
         
-        def on_query_datasets():
+        # def on_query_datasets():
+        #     try:
+        #         # names = fetch_dataset_names()
+        #         names = _get_client(region_state.value).list_datasets()
+        #     except Exception as exc:
+        #         logger.exception("Failed to load dataset names")
+        #         raise gr.Error(f"Could not load dataset names: {exc}") from exc
+        #     if not names:
+        #         gr.Warning("No datasets found in the business unit mapping table.")
+        #     return gr.update(choices=names)
+
+        def on_query_datasets(region: str):
             try:
-                names = fetch_dataset_names()
+                names = _get_client(region).list_datasets()
             except Exception as exc:
-                logger.exception("Failed to load dataset names")
-                raise gr.Error(f"Could not load dataset names: {exc}") from exc
+                logger.exception(
+                    "Failed to load dataset names for region %s",
+                    region,
+                )
+                raise gr.Error(
+                    f"Could not load dataset names for region '{region}': {exc}"
+                ) from exc
             if not names:
-                gr.Warning("No datasets found in the business unit mapping table.")
-            return gr.update(choices=names)
+                gr.Warning(f"No datasets found in the '{region}' region.")
+            return gr.update(choices=names, value=None)
         
         for field_query_btn, field_dropdown in zip(prompt_field_query_btns, prompt_field_dropdowns):
-            field_query_btn.click(on_query_datasets, None, [field_dropdown])
+            field_query_btn.click(
+                fn=on_query_datasets, 
+                inputs=[region_state], 
+                outputs=[field_dropdown]
+                )
         
         # --- End Prompt Template Selector Section ---
         
@@ -521,21 +607,30 @@ with gr.Blocks(title="Collibra DQ Chatbot") as demo:
         verbose_mode = gr.Checkbox(label="Show activity and reasoning", value=True)
         clear = gr.Button("Clear")
 
-        async def respond_async(message, chat_history, is_authed, verbose, username, session_id):
+        async def respond_async(message, chat_history, is_authed, verbose, username, session_id, region):
+            region = (region or "apac").strip().lower()
+            logger.info(
+                "Processing request for user=%s, session=%s, region=%s",
+                username,
+                session_id,
+                region,
+            )
+
             chat_history = list(chat_history or [])
             if not is_authed:
                 yield chat_history + [{"role": "assistant", "content": "Please log in on the Login tab first."}], ""
                 return
 
-            chat_store.set_session_context(username, session_id)
+            chat_store.set_session_context(username, session_id, region)
             chat_history.append({"role": "user", "content": message})
             invocation_index = len(chat_history)
             chat_history.append(_activity_message("Agent", "Preparing request...", message_id="agent-status"))
             yield chat_history, ""
 
             global agent
-            if agent is None:
-                agent = _build_chat_agent()
+            previous_agent = agent
+            agent = _ensure_chat_agent(region)
+            if previous_agent is None:
                 chat_history[invocation_index]["content"] = mcp_status
                 yield chat_history, ""
 
@@ -627,7 +722,7 @@ with gr.Blocks(title="Collibra DQ Chatbot") as demo:
                 chat_history.append({"role": "assistant", "content": f"Error: {e}"})
 
             try:
-                chat_store.log_chat_turn(username, session_id, chat_history)
+                chat_store.log_chat_turn(username, session_id, region, chat_history)
             except Exception:
                 logger.exception("Failed to persist chat history for session %s", session_id)
 
@@ -635,12 +730,12 @@ with gr.Blocks(title="Collibra DQ Chatbot") as demo:
 
         msg.submit(
             respond_async,
-            [msg, chatbot, auth_state, verbose_mode, username_state, session_id_state],
+            [msg, chatbot, auth_state, verbose_mode, username_state, session_id_state, region_state],
             [chatbot, msg],
         )
         send_button.click(
             respond_async,
-            [msg, chatbot, auth_state, verbose_mode, username_state, session_id_state],
+            [msg, chatbot, auth_state, verbose_mode, username_state, session_id_state, region_state],
             [chatbot, msg],
         )
         
@@ -794,9 +889,13 @@ with gr.Blocks(title="Collibra DQ Chatbot") as demo:
         resume_no_btn.click(dismiss_resume_prompt, None, [resume_banner, resume_row])
 
     login_button.click(
-        authenticate, [username_input, password_input], [login_output, auth_state, username_state]
+        authenticate, 
+        inputs=[region_input, username_input, password_input], 
+        outputs=[login_output, auth_state, username_state, region_state]
     ).then(
-        check_resume, [username_state], [resume_banner, resume_row, resumable_history_state]
+        check_resume, 
+        inputs=[username_state, region_state], 
+        outputs=[resume_banner, resume_row, resumable_history_state]
     )
 
 if __name__ == "__main__":
