@@ -38,6 +38,7 @@ CHANGE_HISTORY_TABLE = os.getenv("DQM_CHANGE_HISTORY_TABLE", "public.dqm_chatbot
 CREATE_CHAT_HISTORY_SQL = f"""
 CREATE TABLE IF NOT EXISTS {CHAT_HISTORY_TABLE} (
     id BIGSERIAL PRIMARY KEY,
+    region TEXT NOT NULL,
     session_id TEXT NOT NULL UNIQUE,
     app_user TEXT NOT NULL,
     conversation_history JSONB NOT NULL,
@@ -102,24 +103,32 @@ def ensure_tables() -> None:
 _session_ctx: contextvars.ContextVar[dict[str, str]] = contextvars.ContextVar("dq_chat_session_ctx", default={})
 
 
-def set_session_context(app_user: str, session_id: str) -> None:
-    _session_ctx.set({"app_user": app_user or "unknown", "session_id": session_id or ""})
+def set_session_context(app_user: str, session_id: str, region: str = "") -> None:
+    _session_ctx.set(
+        {
+            "app_user": app_user or "unknown",
+            "session_id": session_id or "",
+            "region": (region or "apac").strip().lower(),
+        }
+    )
 
 
 def get_session_context() -> dict[str, str]:
-    return _session_ctx.get() or {"app_user": "unknown", "session_id": ""}
+    return _session_ctx.get() or {"app_user": "unknown", "session_id": "", "region": "apac"}
 
 
 # ----------------------------------------------------------------------
 # Chat history
 # ----------------------------------------------------------------------
-def log_chat_turn(app_user: str, session_id: str, conversation_history: list[dict[str, Any]]) -> None:
+def log_chat_turn(app_user: str, session_id: str, region: str, conversation_history: list[dict[str, Any]]) -> None:
     """Upsert the running conversation for one session after each completed turn."""
+    region = (region or "apac").strip().lower()
     settings = _settings_for(CHAT_HISTORY_TABLE)
     sql = f"""
-        INSERT INTO {CHAT_HISTORY_TABLE} (session_id, app_user, conversation_history, turn_count)
-        VALUES (%s, %s, %s, %s)
+        INSERT INTO {CHAT_HISTORY_TABLE} (region, session_id, app_user, conversation_history, turn_count)
+        VALUES (%s, %s, %s, %s, %s)
         ON CONFLICT (session_id) DO UPDATE SET
+            region = EXCLUDED.region,
             app_user = EXCLUDED.app_user,
             conversation_history = EXCLUDED.conversation_history,
             turn_count = EXCLUDED.turn_count,
@@ -127,36 +136,46 @@ def log_chat_turn(app_user: str, session_id: str, conversation_history: list[dic
     """
     with connect(settings) as conn:
         with conn.cursor() as cur:
-            cur.execute(sql, (session_id, app_user, json.dumps(conversation_history, default=str), len(conversation_history)))
+            cur.execute(
+                sql,
+                (region, session_id, app_user, json.dumps(conversation_history, default=str), len(conversation_history)),
+            )
         conn.commit()
 
 
-def get_latest_session(app_user: str) -> Optional[dict[str, Any]]:
+def get_latest_session(app_user: str, region: Optional[str] = None) -> Optional[dict[str, Any]]:
     """Return the most recently updated chat session for this user (session_id,
     conversation_history, turn_count, updated_at), or None if they have no history yet.
     Used at login to offer resuming the previous conversation."""
     if not app_user:
         return None
     settings = _settings_for(CHAT_HISTORY_TABLE)
+    params: list[Any] = [app_user]
+    region_filter = ""
+    if region:
+        region_filter = "AND region = %s"
+        params.append(region.strip().lower())
     sql = f"""
-        SELECT session_id, conversation_history, turn_count, updated_at
+        SELECT region, session_id, conversation_history, turn_count, updated_at
         FROM {CHAT_HISTORY_TABLE}
         WHERE app_user = %s
+        {region_filter}
         ORDER BY updated_at DESC
         LIMIT 1
     """
     with connect(settings) as conn:
         with conn.cursor() as cur:
-            cur.execute(sql, (app_user,))
+            cur.execute(sql, params)
             row = cur.fetchone()
     if not row:
         return None
-    session_id, conversation_history, turn_count, updated_at = row
+    row_region, session_id, conversation_history, turn_count, updated_at = row
     # conversation_history comes back already parsed for JSONB columns, but fall back to
     # a manual json.loads in case the driver/column type ever returns a raw string.
     if isinstance(conversation_history, str):
         conversation_history = json.loads(conversation_history)
     return {
+        "region": row_region,
         "session_id": session_id,
         "conversation_history": conversation_history,
         "turn_count": turn_count,
