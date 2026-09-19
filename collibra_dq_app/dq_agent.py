@@ -86,6 +86,7 @@ def build_agent(
     system_prompt: Optional[str] = None,
     model: Optional[Any] = None,
     mcp_clients: Optional[Sequence[Any]] = None,
+    region: Optional[str] = None,
     **agent_kwargs: Any,
 ) -> "AgentType":
     """Build an Agent with local Collibra tools and optional MCP tool providers.
@@ -97,10 +98,19 @@ def build_agent(
     """
     _require_strands()
     tools = [*ALL_TOOLS, *(mcp_clients or [])]
+    resolved_prompt = system_prompt or _load_system_prompt()
+    if region:
+        normalized_region = region.strip().lower()
+        resolved_prompt = (
+            f"{resolved_prompt}\n\n"
+            f"Current login session region: {normalized_region}. For every Collibra DQ tool call "
+            f"that has a region argument, pass region='{normalized_region}'. Do not use another "
+            "Collibra DQ region during this login session."
+        )
     return Agent(
         model=model or get_model(),
         tools=tools,
-        system_prompt=system_prompt or _load_system_prompt(),
+        system_prompt=resolved_prompt,
         **agent_kwargs,
     )
 
