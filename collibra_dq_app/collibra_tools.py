@@ -1569,7 +1569,14 @@ def apply_dataset_change(change_id: str, change_reason: str) -> dict[str, Any]:
         }
     elif change["action"] == "assign_alert":
         result = client.create_alert(change["alert_payload"])
-        existing_alert = change.get("existing_alert") or {}
+        existing_alerts = change.get("existing_alert") or []
+        if isinstance(existing_alerts, list):
+            existing_alert = next(
+                (a for a in existing_alerts if a.get("alertNm") == change["alert_payload"].get("alertNm")),
+                {}
+            )
+        else:
+            existing_alert = existing_alerts or {}
         log_result = _log_change_entries(
             dataset,
             region,
@@ -1827,6 +1834,22 @@ def propose_alert_update(
     """Preview setting/changing the alert for a dataset. This does NOT write anything --
     it returns a change_id. Show it to the user and only call apply_dataset_change after they
     explicitly confirm.
+    alert_payload can come from the output of get_dataset_alert for existing alerts.
+    modifications should be made to this payload before passing it to this function.
+    final input alert_payload should always use following format:
+    {
+        "dataset": dataset,
+        "alertNm": ALERT_NAME,
+        "alertCond": ALERT_CONDITION,
+        "alertFormat": "EMAIL",
+        "alertFormatValue": ALERT_RECIPIENT,
+        "alertMsg": "",
+        "batchName": "",
+        "addRuleDetails": False,
+        "active": True,
+        "ruleName": "",
+        "alertTypes": ["CONDITION"],
+    }
 
     Args:
         dataset: Collibra DQ dataset name.
