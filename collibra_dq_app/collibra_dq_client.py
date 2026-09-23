@@ -13,12 +13,11 @@ on its own.
 
 from __future__ import annotations
 
+from typing import Any, Dict, Mapping, List, Optional
 import copy
 import logging
 import os
 import sys
-from typing import Any, Optional
-
 import requests
 import urllib3
 
@@ -30,6 +29,21 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 logger = logging.getLogger(__name__)
 
+# profile drift threshold: for delta profile
+DEFAULT_DRIFT_THRESHOLDS = {
+    "none_upper": 1.0,
+    "low_upper": 5.0,
+    "medium_upper": 10.0,
+}
+# severity ranking for profile drift
+SEVERITY_RANK = {
+    "UNKNOWN": -1,
+    "NONE": 0,
+    "LOW": 1,
+    "MEDIUM": 2,
+    "HIGH": 3,
+    "CRITICAL": 4,
+}
 
 class CollibraDQError(Exception):
     """Raised when a Collibra CDQ API call fails after retrying token refresh."""
@@ -121,7 +135,7 @@ class CollibraDQClient:
         return market, project, cde
 
     # ------------------------------------------------------------------
-    # Read: dataset definitions / findings / rules
+    # Read: dataset definitions / findings / rules / profile delta / topN-bottomN
     # ------------------------------------------------------------------
     def get_dataset_def(self, dataset: str) -> dict[str, Any]:
         return self._request("GET", f"/v3/datasetDefs/{dataset}")
@@ -145,6 +159,762 @@ class CollibraDQClient:
         "tr_jnj_check_null_empty" -- each has ruleName, ruleValue ($colNm placeholder),
         ruleTyp, ruleDescription, dimId, etc."""
         return self._request("GET", "/v2/templateRules") or []
+
+    def get_profile_delta(self, dataset: str, run_date: str) -> list[dict[str, Any]]:
+        """GET /v3/profile/deltas?dataset={dataset}&runId={run_date} to 
+        retrieve the profile delta for a specific dataset run.
+        The output JSON is a column-by-column profile drift response:
+        - baseline says what the column historically looks like
+        - datasetField says what the latest run observed
+        - historicalSchema and currentSchema support schema drift detection
+        - Top-level delta fields quantify the differences
+        - validValuesRule carries an automatically generated range failure condition
+        - changePercent summarises non-uniqueness profile differences
+        - changePercentWithUniques appears to extend that score with uniqueness drift
+
+        Args:
+            dataset (str): The dataset identifier.
+            run_date (str): The run date of the dataset.
+
+        Returns:
+            list[dict[str, Any]]: The profile delta as a list of dictionaries.
+        """
+        return self._request(
+            "GET", 
+            f"/v3/profile/deltas", 
+            params={"dataset": dataset, "runId": run_date}
+            )
+
+    @staticmethod
+    def safe_float(value: Any) -> Optional[float]:
+        """Convert value to float when possible."""
+        if value is None:
+            return None
+
+        if isinstance(value, (int, float)):
+            return float(value)
+
+        if isinstance(value, str):
+            value = value.strip()
+
+            if value in ("", "---"):
+                return None
+
+            try:
+                return float(value)
+            except ValueError:
+                return None
+
+        return None
+
+    @staticmethod
+    def normalize_profile_delta_record(record: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Normalize a single Collibra profile delta record.
+        """
+
+        baseline = record.get("baseline", {})
+        dataset_field = record.get("datasetField", {})
+        historical_schema = record.get("historicalSchema", {})
+        current_schema = record.get("currentSchema", {})
+
+        data_type = (
+            dataset_field.get("actualDataType")
+            or current_schema.get("colSchema")
+            or historical_schema.get("colSchema")
+        )
+
+        historical_type = historical_schema.get("colSchema")
+        current_type = current_schema.get("colSchema")
+
+        schema_changed = (
+            historical_type is not None
+            and current_type is not None
+            and historical_type != current_type
+        )
+
+        mean_value = (
+            CollibraDQClient.safe_float(dataset_field.get("meanAbsNum"))
+            if dataset_field.get("meanAbsNum") is not None
+            else CollibraDQClient.safe_float(dataset_field.get("meanAbs"))
+        )
+
+        return {
+            "dataset": record.get("dataset"),
+            "column": record.get("colName"),
+            "run_id": dataset_field.get("runId"),
+
+            "data_type": {
+                "historical": historical_type,
+                "current": current_type,
+                "detected": data_type,
+                "changed": schema_changed,
+            },
+
+            "current_profile": {
+                "null_percent": dataset_field.get("nullRatio"),
+                "empty_percent": dataset_field.get("emptyRatio"),
+                "filled_percent": dataset_field.get("filledRatio"),
+
+                "distinct_count": dataset_field.get("uniqueCnt"),
+                "distinct_ratio": dataset_field.get("uniqueRatio"),
+
+                "minimum": (
+                    dataset_field.get("minAbsNum")
+                    if dataset_field.get("minAbsNum") is not None
+                    else dataset_field.get("minAbs")
+                ),
+
+                "maximum": (
+                    dataset_field.get("maxAbsNum")
+                    if dataset_field.get("maxAbsNum") is not None
+                    else dataset_field.get("maxAbs")
+                ),
+
+                "mean": mean_value,
+
+                "actual_data_type": dataset_field.get("actualDataType"),
+                "pass_fail": dataset_field.get("passFail"),
+            },
+
+            "baseline_profile": {
+                "average_null_percent": baseline.get("avg_nulls"),
+                "average_empty_percent": baseline.get("avg_empties"),
+                "average_filled_percent": baseline.get("avg_filled_ratio"),
+
+                "average_distinct_count": baseline.get("avg_unique_cnt"),
+                "median_distinct_count": baseline.get("median_unique_cnt"),
+
+                "average_distinct_ratio": baseline.get("avg_uniques"),
+                "median_distinct_ratio": baseline.get("median_unique_ratio"),
+
+                "average_numeric_min": baseline.get("avg_min_abs_num"),
+                "average_numeric_max": baseline.get("avg_max_abs_num"),
+                "average_numeric_mean": baseline.get("avg_mean_abs_num"),
+            },
+
+            "delta": {
+                "datatype": record.get("dtcntDelta"),
+                "null": record.get("ncntDelta"),
+                "empty": record.get("ecntDelta"),
+                "distinct_count": record.get("uniqueDelta"),
+                "distinct_percent": record.get("uniqueDeltaPercent"),
+
+                "overall": record.get("changePercent"),
+                "overall_with_uniques": record.get(
+                    "changePercentWithUniques"
+                ),
+            },
+
+            "generated_failure_condition": record.get("validValuesRule"),
+
+            "schema_metadata": {
+                "is_key": current_schema.get("isKey"),
+                "is_pii": current_schema.get("isPii"),
+                "is_mnpi": current_schema.get("isMnpi"),
+                "is_masked": current_schema.get("isMasked"),
+                "enabled": current_schema.get("enabled"),
+            },
+
+            "passed": dataset_field.get("passFail") == 1,
+        }
+
+    @staticmethod
+    def _absolute_difference(
+        current: Any,
+        baseline: Any,
+    ) -> Optional[float]:
+        """Return the absolute difference between twoes."""
+        current_number = CollibraDQClient.safe_float(current)
+        baseline_number = CollibraDQClient.safe_float(baseline)
+
+        if current_number is None or baseline_number is None:
+            return None
+
+        return abs(current_number - baseline_number)
+
+    @staticmethod
+    def _relative_change_percent(
+        current: Any,
+        baseline: Any,
+    ) -> Optional[float]:
+        """
+        Calculate absolute relative percentage change.
+
+        Example:
+            baseline = 100
+            current = 110
+            result = 10.0
+
+        If both values are zero, the result is zero.
+        ne is zero but the current value is non-zero,
+        the relative change is undefined and None is returned.
+        """
+        current_number = CollibraDQClient.safe_float(current)
+        baseline_number = CollibraDQClient.safe_float(baseline)
+
+        if current_number is None or baseline_number is None:
+            return None
+
+        if baseline_number == 0:
+            return 0.0 if current_number == 0 else None
+
+        return abs(
+            (current_number - baseline_number)
+            / baseline_number
+            * 100
+        )
+
+    @staticmethod
+    def _severity_from_change(
+        absolute_change: Optional[float],
+        thresholds: Mapping[str, float],
+    ) -> str:
+        """
+        Convert an absolute percentage-point change into a severity.
+
+        Default classification:
+            < 1.0   -> NONE
+            < 5.0   -> LOW
+            < 10.0  -> MEDIUM
+            >= 10.0 -> HIGH
+        """
+        if absolute_change is None:
+            return "UNKNOWN"
+
+        if absolute_change < thresholds["none_upper"]:
+            return "NONE"
+
+        if absolute_change < thresholds["low_upper"]:
+            return "LOW"
+
+        if absolute_change < thresholds["medium_upper"]:
+            return "MEDIUM"
+
+        return "HIGH"
+
+    @staticmethod
+    def _highest_severity(*severities: str) -> str:
+        """Return the highest severity from the supplied values."""
+        valid_severities = [
+            severity
+            for severity in severities
+            if severity in SEVERITY_RANK
+        ]
+
+        if not valid_severities:
+            return "UNKNOWN"
+
+        return max(
+            valid_severities,
+            key=lambda severity: SEVERITY_RANK[severity],
+        )
+
+    @staticmethod
+    def assess_profile_drift(
+        normalised_record: Dict[str, Any],
+        *,
+        thresholds: Optional[Mapping[str, float]] = None,
+    ) -> Dict[str, Any]:
+        """
+        Assess schema, completeness, and uniqueness drift for one
+        record produced by normalize_profile_delta_record().
+
+        Completeness severity is based on the larger of:
+            - Null percentage-point change
+            - Empty percentage-point change
+            - Filled percentage-point change
+
+        Uniqueness severity is based primarily on:
+            - Unique-ratio percentage-point change
+
+        The unique-count change is included as context, but it is not used
+        as the primary severity measure because a small absolute count change
+        can produce a very high relative percentage for low-cardinality fields.
+
+        Schema changes are classified as CRITICAL.
+
+        Args:
+            normalised_record:
+                Output from normalize_profile_delta_record().
+
+            thresholds:
+                Optional severity thresholds expressed in percentage points.
+
+                Required keys:
+                    none_upper
+                    low_upper
+                    medium_upper
+
+        Returns:
+            A copy of the normalised record with a `drift_assessment` object.
+        """
+        configured_thresholds = dict(
+            thresholds or DEFAULT_DRIFT_THRESHOLDS
+        )
+
+        required_thresholds = {
+            "none_upper",
+            "low_upper",
+            "medium_upper",
+        }
+
+        missing_thresholds = (
+            required_thresholds - configured_thresholds.keys()
+        )
+
+        if missing_thresholds:
+            raise ValueError(
+                "Missing drift threshold settings: "
+                f"{sorted(missing_thresholds)}"
+            )
+
+        if not (
+            0 <= configured_thresholds["none_upper"]
+            <= configured_thresholds["low_upper"]
+            <= configured_thresholds["medium_upper"]
+        ):
+            raise ValueError(
+                "Thresholds must satisfy: "
+                "0 <= none_upper <= low_upper <= medium_upper"
+            )
+
+        current = normalised_record.get("current_profile") or {}
+        baseline = normalised_record.get("baseline_profile") or {}
+        data_type = normalised_record.get("data_type") or {}
+        delta = normalised_record.get("delta") or {}
+
+        # -------------------------------------------------------------
+        # Schema drift
+        # -------------------------------------------------------------
+
+        historical_type = data_type.get("historical")
+        current_type = data_type.get("current")
+        detected_type = data_type.get("detected")
+
+        schema_changed = bool(data_type.get("changed"))
+
+        # Protect against a normaliser that did not set `changed`.
+        if (
+            historical_type is not None
+            and current_type is not None
+            and historical_type != current_type
+        ):
+            schema_changed = True
+
+        detected_type_mismatch = (
+            detected_type is not None
+            and current_type is not None
+            and detected_type != current_type
+        )
+
+        if schema_changed:
+            schema_severity = "CRITICAL"
+            schema_reason = (
+                f"Column type changed from {historical_type!r} "
+                f"to {current_type!r}."
+            )
+        elif detected_type_mismatch:
+            schema_severity = "HIGH"
+            schema_reason = (
+                f"The detected type {detected_type!r} does not match "
+                f"the current schema type {current_type!r}."
+            )
+        elif historical_type is None and current_type is None:
+            schema_severity = "UNKNOWN"
+            schema_reason = "Historical and current schema types are unavailable."
+        else:
+            schema_severity = "NONE"
+            schema_reason = "No schema type change was detected."
+
+        # -------------------------------------------------------------
+        # Completeness drift
+        # -------------------------------------------------------------
+
+        current_null = CollibraDQClient.safe_float(current.get("null_percent"))
+        baseline_null = CollibraDQClient.safe_float(
+            baseline.get("average_null_percent")
+        )
+        null_change_pp = CollibraDQClient._absolute_difference(
+            current_null,
+            baseline_null,
+        )
+
+        current_empty = CollibraDQClient.safe_float(current.get("empty_percent"))
+        baseline_empty = CollibraDQClient.safe_float(
+            baseline.get("average_empty_percent")
+        )
+        empty_change_pp = CollibraDQClient._absolute_difference(
+            current_empty,
+            baseline_empty,
+        )
+
+        current_filled = CollibraDQClient.safe_float(current.get("filled_percent"))
+        baseline_filled = CollibraDQClient.safe_float(
+            baseline.get("average_filled_percent")
+        )
+        filled_change_pp = CollibraDQClient._absolute_difference(
+            current_filled,
+            baseline_filled,
+        )
+
+        available_completeness_changes = [
+            value
+            for value in (
+                null_change_pp,
+                empty_change_pp,
+                filled_change_pp,
+            )
+            if value is not None
+        ]
+
+        completeness_max_change_pp = (
+            max(available_completeness_changes)
+            if available_completeness_changes
+            else None
+        )
+
+        completeness_severity = CollibraDQClient._severity_from_change(
+            completeness_max_change_pp,
+            configured_thresholds,
+        )
+
+        if completeness_max_change_pp is None:
+            completeness_reason = (
+                "Current or baseline completeness metrics are unavailable."
+            )
+        elif completeness_severity == "NONE":
+            completeness_reason = (
+                "Completeness differences are below the configured "
+                f"{configured_thresholds['none_upper']} percentage-point "
+                "noise threshold."
+            )
+        else:
+            completeness_components = {
+                "null percentage": null_change_pp,
+                "empty percentage": empty_change_pp,
+                "filled percentage": filled_change_pp,
+            }
+
+            largest_component = max(
+                (
+                    (name, value)
+                    for name, value in completeness_components.items()
+                    if value is not None
+                ),
+                key=lambda item: item[1],
+            )
+
+            completeness_reason = (
+                f"The largest completeness change is in "
+                f"{largest_component[0]} at "
+                f"{largest_component[1]:.5f} percentage points."
+            )
+
+        # -------------------------------------------------------------
+        # Uniqueness drift
+        # -------------------------------------------------------------
+
+        current_distinct_count = CollibraDQClient.safe_float(
+            current.get("distinct_count")
+        )
+        baseline_distinct_count = CollibraDQClient.safe_float(
+            baseline.get("average_distinct_count")
+        )
+
+        distinct_count_change = CollibraDQClient._absolute_difference(
+            current_distinct_count,
+            baseline_distinct_count,
+        )
+
+        distinct_count_relative_change_pct = CollibraDQClient._relative_change_percent(
+            current_distinct_count,
+            baseline_distinct_count,
+        )
+
+        current_distinct_ratio = CollibraDQClient.safe_float(
+            current.get("distinct_ratio")
+        )
+        baseline_distinct_ratio = CollibraDQClient.safe_float(
+            baseline.get("average_distinct_ratio")
+        )
+
+        # Collibra's uniqueRatio values in your payload are fractions:
+        # 0.255869 means approximately 25.5869%, not 0.255869%.
+        distinct_ratio_change_fraction = CollibraDQClient._absolute_difference(
+            current_distinct_ratio,
+            baseline_distinct_ratio,
+        )
+
+        distinct_ratio_change_pp = (
+            distinct_ratio_change_fraction * 100
+            if distinct_ratio_change_fraction is not None
+            else None
+        )
+
+        uniqueness_severity = CollibraDQClient._severity_from_change(
+            distinct_ratio_change_pp,
+            configured_thresholds,
+        )
+
+        if distinct_ratio_change_pp is None:
+            uniqueness_reason = (
+                "Current or baseline distinct-ratio metrics are unavailable."
+            )
+        elif uniqueness_severity == "NONE":
+            uniqueness_reason = (
+                "The distinct-ratio difference is below the configured "
+                f"{configured_thresholds['none_upper']} percentage-point "
+                "noise threshold."
+            )
+        else:
+            uniqueness_reason = (
+                f"The distinct ratio changed by "
+                f"{distinct_ratio_change_pp:.5f} percentage points."
+            )
+
+        # -------------------------------------------------------------
+        # Overall assessment
+        # -------------------------------------------------------------
+
+        overall_severity = CollibraDQClient._highest_severity(
+            schema_severity,
+            completeness_severity,
+            uniqueness_severity,
+        )
+
+        triggered_dimensions = [
+            dimension
+            for dimension, severity in (
+                ("schema", schema_severity),
+                ("completeness", completeness_severity),
+                ("uniqueness", uniqueness_severity),
+            )
+            if SEVERITY_RANK.get(severity, -1) > SEVERITY_RANK["NONE"]
+        ]
+
+        if overall_severity == "UNKNOWN":
+            overall_reason = (
+                "Insufficient information is available to assess drift."
+            )
+        elif overall_severity == "NONE":
+            overall_reason = (
+                "No material schema, completeness, or uniqueness drift "
+                "was detected."
+            )
+        else:
+            overall_reason = (
+                f"The highest detected severity is {overall_severity}. "
+                f"Triggered dimensions: {', '.join(triggered_dimensions)}."
+            )
+
+        drift_assessment = {
+            "schema_drift": {
+                "historical_type": historical_type,
+                "current_type": current_type,
+                "detected_type": detected_type,
+                "changed": schema_changed,
+                "detected_type_mismatch": detected_type_mismatch,
+                "severity": schema_severity,
+                "reason": schema_reason,
+            },
+            "completeness_drift": {
+                "null": {
+                    "baseline_percent": baseline_null,
+                    "current_percent": current_null,
+                    "absolute_change_pp": null_change_pp,
+                },
+                "empty": {
+                    "baseline_percent": baseline_empty,
+                    "current_percent": current_empty,
+                    "absolute_change_pp": empty_change_pp,
+                },
+                "filled": {
+                    "baseline_percent": baseline_filled,
+                    "current_percent": current_filled,
+                    "absolute_change_pp": filled_change_pp,
+                },
+                "maximum_absolute_change_pp": (
+                    completeness_max_change_pp
+                ),
+                "collibra_null_delta": delta.get("null"),
+                "collibra_empty_delta": delta.get("empty"),
+                "severity": completeness_severity,
+                "reason": completeness_reason,
+            },
+            "uniqueness_drift": {
+                "distinct_count": {
+                    "baseline": baseline_distinct_count,
+                    "current": current_distinct_count,
+                    "absolute_change": distinct_count_change,
+                    "relative_change_percent": (
+                        distinct_count_relative_change_pct
+                    ),
+                },
+                "distinct_ratio": {
+                    "baseline_fraction": baseline_distinct_ratio,
+                    "current_fraction": current_distinct_ratio,
+                    "absolute_change_pp": distinct_ratio_change_pp,
+                },
+                "collibra_distinct_count_delta": (
+                    delta.get("distinct_count")
+                ),
+                "collibra_distinct_percent_delta": (
+                    delta.get("distinct_percent")
+                ),
+                "severity": uniqueness_severity,
+                "reason": uniqueness_reason,
+            },
+            "overall_severity": overall_severity,
+            "overall_reason": overall_reason,
+            "thresholds_percentage_points": configured_thresholds,
+        }
+
+        # Return a new object instead of modifying the caller's object.
+        return {
+            **normalised_record,
+            "drift_assessment": drift_assessment,
+        }
+
+    def get_topn_bottomn_by_field(self, dataset: str, run_date: str, fieldnm: str) -> dict[str, Any]:
+        """GET /v2/gettopandbottomnnsortedbyfield?dataset={dataset}&runId={run_date}&fieldnm={fieldnm}&sort=DESC 
+        to retrieve the topN-bottomN for a specific field in a dataset run.
+
+        Args:
+            dataset (str): The dataset identifier.
+            run_date (str): The run date of the dataset.
+            fieldnm (str): The field name to retrieve topN-bottomN for.
+
+        Returns:
+            list[dict[str, Any]]: 
+            The topN-bottomN as a list of dictionaries for the specific field, example:
+        [
+            {
+                "id": 0,
+                "dataset": "ds_ods_jp_itg_mdm_employee",
+                "runId": "2026-09-09T16:00:00.000+0000",
+                "fieldNm": "modified_by",
+                "fieldFunc": "TOPN",
+                "fieldValue": "system",
+                "uniqueCnt": 13733,
+                "updtTs": "2026-09-10T02:08:36.938+0000"
+            }
+        ]
+        """
+        return self._request(
+            "GET", 
+            f"/v2/gettopandbottomnnsortedbyfield", 
+            params={"dataset": dataset, "runId": run_date, "fieldnm": fieldnm, "sort": "DESC"}
+        )
+
+    @staticmethod
+    def normalize_topn_bottomn(records: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """
+        Normalize Collibra TOPN/BOTTOMN API response into
+        a compact structure
+        
+        Args:
+            records (List[Dict[str, Any]]): The raw response from the Collibra TOPN/BOTTOMN API.
+
+        Returns:
+            Dict[str, Any]: A normalized, compact structure representing the topN-bottomN data, example:
+        {
+            "dataset": "ds_ods_jp_itg_mdm_employee",
+            "columns": ["cost_center"],
+            "run_id": "2026-09-09T16:00:00.000+0000",
+            "profile_type": "TOPN",
+            "generated_at": "2026-09-10T02:08:36.929+0000",
+            "cost_center": 
+            [
+                {
+                "value": null,
+                "count": 11189
+                },
+                {
+                "value": "JPE8508",
+                "count": 330
+                },
+                {
+                "value": "JPE8103",
+                "count": 282
+                }
+            ]
+        }
+        """
+
+        if not records:
+            return {}
+
+        first = records[0]
+        columns = set(list({row.get("fieldNm") for row in records}))
+        profile = {
+            "dataset": first.get("dataset"),
+            "columns": list(columns),
+            "run_id": first.get("runId"),
+            "profile_type": first.get("fieldFunc"),
+            "generated_at": first.get("updtTs"),
+        }
+        # Extract all column names from the records
+        for col in columns:
+            col_records = [row for row in records if row.get("fieldNm") == col]
+            values = []
+            for row in col_records:
+                value = row.get("fieldValue")
+                if value in ("null", "NULL", ""):
+                    value = None
+                values.append(
+                    {
+                        "value": value,
+                        "count": int(row["uniqueCnt"])
+                        if row.get("uniqueCnt") is not None
+                        else None,
+                    }
+                )
+            profile[col] = values
+
+        return profile
+
+    def get_topn_bottomn_sorted(self, dataset: str, run_date: str, sort: str = "DESC") -> list[dict[str, Any]]:
+        """GET /v2/gettopandbottomnnsorted?dataset={dataset}&runId={run_date}&sort={sort} 
+        to retrieve the topN-bottomN for all fields in a dataset run, sorted by the specified order.
+
+        Args:
+            dataset (str): The dataset identifier.
+            run_date (str): The run date of the dataset.
+            sort (str, optional): The sort order, either "ASC" or "DESC". Defaults to "DESC".
+
+        Returns:
+            list[dict[str, Any]]: The topN-bottomN as a list of dictionaries for all fields.
+        example:
+        [
+            {
+                "id": 0,
+                "dataset": "ds_ods_jp_itg_mdm_employee",
+                "runId": "2026-09-09T16:00:00.000+0000",
+                "fieldNm": "band_code",
+                "fieldFunc": "TOPN",
+                "fieldValue": "null",
+                "uniqueCnt": 19643,
+                "updtTs": "2026-09-10T02:08:36.596+0000"
+            },
+            {
+                "id": 0,
+                "dataset": "ds_ods_jp_itg_mdm_employee",
+                "runId": "2026-09-09T16:00:00.000+0000",
+                "fieldNm": "modified_by",
+                "fieldFunc": "TOPN",
+                "fieldValue": "system",
+                "uniqueCnt": 13733,
+                "updtTs": "2026-09-10T02:08:36.938+0000"
+            }
+        ]
+        """
+        return self._request(
+            "GET", 
+            f"/v2/gettopandbottomnnsorted", 
+            params={"dataset": dataset, "runId": run_date, "sort": sort}
+        )
+    
 
     # ------------------------------------------------------------------
     # Write: create / update dataset definitions
