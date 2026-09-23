@@ -325,9 +325,9 @@ ENTER_TO_SUBMIT_JS = """
 """
 
 
-with gr.Blocks(title="Collibra DQ Chatbot") as demo:
-    gr.Markdown("# Collibra DQ Chatbot")
-    gr.Markdown("Inspect and modify Collibra DQ dataset definitions (Disclaimer: AI could be wrong).")
+with gr.Blocks(title="Data Quality AI Assistant") as demo:
+    gr.Markdown("# Data Quality AI Assistant")
+    gr.Markdown("One-stop platform for DQ management (Disclaimer: AI could be wrong).")
 
     with gr.Tab("Login"):
         region_input = gr.Dropdown(
