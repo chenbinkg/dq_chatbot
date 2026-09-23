@@ -171,6 +171,97 @@ def _redshift_credentials() -> tuple[str, str, str]:
     return user, password, dbname
 
 
+def profile_columns(cluster: str, db_mn: str, table_mn: str, column_names: list[str]) -> dict[str, Any]:
+    """Profile columns from a Redshift table to gather basic statistics such as 
+    null fraction, distinct values count, max and min values."""
+    import psycopg2
+
+    clusters = _resolve_clusters(cluster)
+    if cluster not in clusters:
+        raise ValueError(f"Cluster '{cluster}' not found.")
+    host = clusters[cluster]
+    user, password, dbname = _redshift_credentials()
+
+    conn = psycopg2.connect(host=host, port=5439, dbname=dbname, user=user, password=password, connect_timeout=15)
+    try:
+        with conn.cursor() as cur:
+            distinct_counts = []
+            null_counts = []
+            max_values = []
+            min_values = []
+            for column_name in column_names:
+                cur.execute(
+                    "SELECT COUNT(DISTINCT {}) AS distinct_count, COUNT(*) - COUNT({}) AS null_count, MAX({}) AS max_value, MIN({}) AS min_value FROM {}.{}".format(
+                        column_name, column_name, column_name, column_name, db_mn, table_mn
+                    )
+                )
+                distinct_count, null_count, max_value, min_value = cur.fetchone()
+                distinct_counts.append(distinct_count)
+                null_counts.append(null_count)
+                max_values.append(max_value)
+                min_values.append(min_value)
+
+    finally:
+        conn.close()
+
+    return [
+        {
+            "cluster": cluster,
+            "db_mn": db_mn,
+            "table_mn": table_mn,
+            "column_name": column_name,
+            "distinct_count": distinct_count,
+            "null_fraction": null_count / (distinct_count + null_count) if (distinct_count + null_count) > 0 else 0,
+            "max_value": max_value,
+            "min_value": min_value,
+        }
+        for column_name, distinct_count, null_count, max_value, min_value in zip(
+            column_names, distinct_counts, null_counts, max_values, min_values
+        )
+    ]
+
+
+def profile_table(cluster: str, db_mn: str, table_mn: str) -> dict[str, Any]:
+    """Profile a Redshift table to gather basic statistics such as row count, 
+    column count, and column data types."""
+    import psycopg2
+
+    clusters = _resolve_clusters(cluster)
+    if cluster not in clusters:
+        raise ValueError(f"Cluster '{cluster}' not found.")
+    host = clusters[cluster]  # type: ignore[assignment,strict-optional]
+    user, password, dbname = _redshift_credentials()
+
+    conn = psycopg2.connect(host=host, port=5439, dbname=dbname, user=user, password=password, connect_timeout=15)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT COUNT(*) AS row_count FROM {}.{}".format(db_mn, table_mn)
+            )
+            row_count = cur.fetchone()[0]
+
+            cur.execute(
+                "SELECT column_name, data_type FROM information_schema.columns WHERE table_schema = %s AND table_name = %s",
+                (db_mn, table_mn)
+            )
+            fetched = cur.fetchall()
+            columns = [col for col, dtype in fetched]
+            data_types = {col: dtype for col, dtype in fetched}
+
+    finally:
+        conn.close()
+
+    return {
+        "cluster": cluster,
+        "db_mn": db_mn,
+        "table_mn": table_mn,
+        "row_count": row_count,
+        "column_count": len(columns),
+        "columns": columns,
+        "data_types": data_types
+    }
+
+
 def search_tables(keyword: str, cluster: Optional[str] = None, db_mn: Optional[str] = None, limit: int = 50) -> dict[str, Any]:
     """Search svv_tables (covers native + external/Spectrum schemas) for table names
     containing `keyword`, across one or both Redshift clusters. Read-only. Use this to find
@@ -260,7 +351,23 @@ def run_readonly_query(cluster: str, query: str, limit: int = 20) -> dict[str, A
     rows -- e.g. to test/troubleshoot a candidate custom-rule query (with `@dataset_name`
     tokens replaced by the real schema.table, since those tokens are Collibra-only
     substitutions and not valid raw SQL) before saving it. Rejects anything that isn't a
-    single SELECT statement."""
+    single SELECT statement. Resultant query could be something like:
+    SELECT * FROM (
+        SELECT *
+        FROM public.customer
+        WHERE customer_id IS NULL
+    ) AS _rule_test
+    LIMIT 20
+    Args:
+        cluster: The Redshift cluster to run the query against.
+        query: The read-only SELECT query to execute.
+        limit: Maximum number of rows to return.
+
+    Returns:
+        A dictionary containing the cluster name, row count, column names, sample rows, 
+        and the executed query.
+
+    """
     import psycopg2
 
     stripped = (query or "").strip().rstrip(";")
