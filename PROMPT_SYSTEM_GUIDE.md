@@ -123,7 +123,7 @@ The chatbot UI now supports **pre-configured prompts** that allow users to quick
 - Create New Redshift Dataset
 
 ### Custom Rules (2 prompts)
-- Create DQ Custom Rule
+- Create DQ Custom Rule (dataset, column name, DQ dimension, description, SQL condition)
 - Update DQ Custom Rule
 
 ### JIRA Operations (3 prompts)
