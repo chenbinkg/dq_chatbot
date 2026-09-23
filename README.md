@@ -20,6 +20,8 @@ The local agent can query either the `apac` or `cn` CDQ deployment to:
 - Resolve a dataset's business-unit mapping and parse its market, project, and CDE status.
 - List available business units, active DQ rules, and the live metaTag catalog.
 - Retrieve DQ findings for a dataset and run date, and check whether a single rule passed on a given run (`validate_rule_run`) after a `ruleValue` change.
+- Retrieve the normalized profile delta for a dataset run (`get_delta_profile`), summarizing data type, current profile, baseline profile, delta, and the generated adaptive rule condition, with `passed` flagging an adaptive rule break.
+- Retrieve normalized topN/bottomN value distributions for a run, for all columns or a chosen subset (`get_topn_bottomn_profile`), to trace a uniqueness/cardinality or row-count break down to the column values that moved.
 - Retrieve dataset definition table from postgres table `public.dqm_dataset_definitions` produced by automation pipeline
 
 ### Dataset and metadata assistance
@@ -29,6 +31,7 @@ The assistant provides read-only helpers that ground recommendations in reposito
 - Suggest a compliant dataset name for a Redshift table or S3 file.
 - Probe both configured Redshift clusters to determine whether a table is on the `local` or `region` cluster.
 - Sample Redshift column names and rows with a bounded `SELECT ... LIMIT` query.
+- Profile a Redshift table (`profile_dataset`) for row count, column count, column list, and data types, and profile chosen columns (`profile_columns`) for distinct count, null fraction, min, and max -- the basis for deciding which columns are worth monitoring when proposing custom rules for a new dataset.
 - Search Redshift table and column names by keyword across both clusters, to find the physical `schema.table`/join column backing a cross-reference before it has a CDQ dataset.
 - Run a single, wrapped and row-capped read-only `SELECT` against Redshift to troubleshoot a candidate custom-rule query before saving it.
 - List objects under an S3 bucket/prefix and sample a CSV file's header and rows via a ranged, size-capped `GET` -- the S3 equivalent of Redshift sampling, so new S3-backed datasets can be grounded in real file content.
@@ -54,7 +57,7 @@ Supported write workflows include:
 - Update DatasetDef metadata tags, schedule time, job description, or `linkId`.
 - Enable/disable a dataset's modifiable profile checks (row/null/empty/time/min/max/mean/unique/string-length); a fixed set of Collibra UI defaults can never be changed.
 - Create a new Redshift- or S3-backed dataset from a known-good reference template.
-- Create or update a single custom DQ rule for a dataset (`POST /v3/rules`, matched by `ruleNm`), including renaming one (no rename endpoint exists, so this deletes the old rule and creates the new one under a fresh name).
+- Create or update custom DQ rules for a dataset (`POST /v3/rules`, matched by `ruleNm`). `propose_rule_change` takes a list of rule payloads, so every rule for a dataset is proposed in one call, shares one `change_id`, and is written by a single `apply_dataset_change` that triggers exactly one job run. A rename is a single-rule operation (no rename endpoint exists, so this deletes the old rule and creates the new one under a fresh name).
 - Configure the standard `Low Dataset Score` email alert.
 - Create or update a business-unit definition and attach it to a dataset.
 - Trigger a job run after a DatasetDef update, custom rule change, or new dataset creation.
@@ -62,9 +65,11 @@ Supported write workflows include:
 
 New dataset creation applies repository-defined defaults: a Monday-Friday daily schedule in `Asia/Singapore`, standard Spark sizing, selected profiling checks, shape/outlier/pattern layers disabled, and duplicate checking enabled for Redshift datasets with a supplied `linkId`. The tool reports best-practice violations before anything is written.
 
-New custom rules are checked against a naming/typing convention (`columnName` set when the rule targets a column; `ruleNm` starting with `if_{columnName}_...`; one of three `ruleType`/`ruleRepo`/`ruleValue` combinations for template, full-SQL, or condition-only rules) -- reported as non-blocking `best_practice_issues`, never re-flagged when only updating or renaming an existing rule. When a rule change alters `ruleValue`, the proposal reports `requires_run_validation=True`; after applying, `validate_rule_run` fetches the triggered job's findings (`GET /v3/jobs/{dataset}/{run_date}/findings`) and reports whether the rule passed (`breakMsg`/`score`/`exception`) once the job has finished. Renaming a rule or editing only its dimension/description/purpose does not require that validation.
+New custom rules are checked against a naming/typing convention (`columnName` set when the rule targets a column; `ruleNm` starting with `if_{columnName}_...`; one of three `ruleType`/`ruleRepo`/`ruleValue` combinations for template, full-SQL, or condition-only rules) -- reported as non-blocking `best_practice_issues` keyed by rule name, never re-flagged when only updating or renaming an existing rule. Brand-new rule payloads are also normalized before they are sent, filling in the fields Collibra's `/v3/rules` endpoint does not default server-side (`points`, `perc`, `previewLimit`, `runTimeLimit`, `scoringScheme`, `tolerance`, `weight`, `businessCategory`, `businessDesc`, `filterQuery`, `suppressed`, `ruleRepo`) and coercing a JSON boolean `isActive` to `1`/`0`; omitting these produces a server-side 500. When a rule change alters `ruleValue`, the proposal reports `requires_run_validation=True` along with the affected rule names; after applying, `validate_rule_run` fetches the triggered job's findings (`GET /v3/jobs/{dataset}/{run_date}/findings`) and reports whether the rule passed (`breakMsg`/`score`/`exception`) once the job has finished. Renaming a rule or editing only its dimension/description/purpose does not require that validation.
 
-Every applied change is written immediately to the PostgreSQL change-history audit table and queued for Jira. A separate `sync_jira_change_request` tool (called once per dataset, after the user confirms, with the dataset's market so the ticket is attached to the right Jira version) creates or reopens a "DQ Change Request" ticket under a pre-configured epic, stacks the new entries on top of its existing description (long `ruleValue`/SQL diffs are rendered as a compact unified diff instead of the full before/after text), and closes it again. See `collibra_dq_app/jira_logger.py`.
+Applying a rule batch is fault-isolated: each rule is POSTed independently, so one rejection does not abort the rest. Rejected rules come back under `rule_errors` with Collibra's response text and are re-stashed under a `retry_change_id`, the outcome is marked `partially applied`, and only the rules that actually succeeded are written to the audit trail.
+
+Every applied change is written immediately to the PostgreSQL change-history audit table and queued for Jira. A separate `sync_jira_change_request` tool (called once per dataset, after the user confirms, with the dataset's market so the ticket is attached to the right Jira version) creates or reopens a "DQ Change Request" ticket under a pre-configured epic, stacks the new entries on top of its existing description, and closes it again. A changed `ruleValue` is rendered as a compact unified diff with the `---`/`+++` filename headers stripped, since Jira renders them as markup; a brand-new rule has nothing to diff against, so its value is shown verbatim instead. See `collibra_dq_app/jira_logger.py`.
 
 ### Atlassian investigation tools
 
@@ -96,10 +101,10 @@ Strands Agent (collibra_dq_app/dq_agent.py)
 | `collibra_dq_app/app.py` | Local Gradio UI, super-user login, streaming activity display, and agent lifecycle. |
 | `collibra_dq_app/dq_agent.py` | Builds an agent with local Collibra tools and optional MCP clients. |
 | `collibra_dq_app/collibra_tools.py` | Strands tool definitions, read/write workflows, previews, and confirmation enforcement. |
-| `collibra_dq_app/collibra_dq_client.py` | Low-level authenticated Collibra CDQ REST client. |
+| `collibra_dq_app/collibra_dq_client.py` | Low-level authenticated Collibra CDQ REST client, plus profile-delta and topN/bottomN normalization and drift assessment helpers. |
 | `collibra_dq_app/dataset_builder.py` | DatasetDef cloning, source-specific payload construction, validation, and alert defaults. |
 | `collibra_dq_app/dataset_definitions_reference.py` | Lookups against `public.dqm_dataset_definitions` in PostgreSQL. |
-| `collibra_dq_app/redshift_connections.py` | Static connection registry, cluster detection, S3 parsing, table sampling, and key uniqueness checks. |
+| `collibra_dq_app/redshift_connections.py` | Static connection registry, cluster detection, S3 parsing, table sampling, table/column profiling, and key uniqueness checks. |
 | `collibra_dq_app/business_unit.py` | Business-unit hierarchy parsing and market/project inference. |
 | `collibra_dq_app/bu_mapping_reference.py` | Similarity-ranked lookups against the curated PostgreSQL mapping table. |
 | `collibra_dq_app/chat_store.py` | PostgreSQL persistence for chat history (`dqm_chatbot_chat_history`, resumable on next login) and applied-change audit trail (`dqm_chatbot_change_history`). |
@@ -250,7 +255,7 @@ Start the local Gradio application from its directory:
 python collibra_dq_app/app.py
 ```
 
-The app binds to `127.0.0.1:7860` and does not create a public Gradio share link. Open `http://127.0.0.1:7860`, log in with a configured super-user account, and then use the Chat tab.
+The app binds to `127.0.0.1:7860` and does not create a public Gradio share link. Open `http://127.0.0.1:7860`, log in with a configured super-user account, and then use the Chat tab. The UI is branded "Data Quality AI Assistant".
 
 The assistant shows model activity, reasoning when enabled, tool calls, and response progress. The Atlassian MCP connection is initialized lazily after the first authenticated chat request. If it is unavailable, the app reports that it is running with local Collibra tools only.
 
@@ -287,6 +292,7 @@ For a write request, provide the requested schedule, metadata, and key-column de
 - Collibra API tokens are cached in memory and refreshed when missing, near expiry, or after a 401 response.
 - Collibra requests use a 60-second timeout. The token manager currently disables SSL verification for the internal CDQ service, so deployment network controls and certificate policy should be reviewed before production use.
 - Redshift sampling limits results to at most 50 rows (200 for keyword search); `test_redshift_query` only accepts a single `SELECT` statement, wrapped and row-capped. Identifiers are defensively quoted before query execution.
+- `profile_dataset`/`profile_columns` interpolate the supplied schema, table, and column names straight into their aggregate queries without quoting. They are read-only aggregates, but the identifiers should be validated against `information_schema` before this is exposed to untrusted input.
 - S3 access is read-only: `list_s3_objects`/`sample_s3_file` only call `ListObjectsV2`/ranged `GetObject`; there is no upload/overwrite/delete tool, and the agent instructions explicitly refuse such requests.
 - The agent instruction limits batch actions to 10 datasets, and explicitly refuses any request to delete/wipe/mass-remove Collibra DQ configuration -- there is no delete tool exposed.
 - `change_reason` is a mandatory argument to `apply_dataset_change`; the tool raises rather than applying a change without one.
@@ -335,7 +341,7 @@ finally:
 
 ## Pre-Configured Prompt Templates
 
-The chatbot includes a library of 16 pre-configured prompt templates organized into 6 categories to help users quickly construct complex requests:
+The chatbot includes a library of 18 pre-configured prompt templates organized into 6 categories to help users quickly construct complex requests:
 
 ### Template Categories
 
@@ -353,7 +359,7 @@ The chatbot includes a library of 16 pre-configured prompt templates organized i
 - Redshift table-backed dataset creation
 
 **Custom Rules** (2 templates)
-- Create new custom DQ rules
+- Create new custom DQ rules (with optional column name and DQ dimension)
 - Update existing custom rules
 
 **JIRA Operations** (3 templates)
@@ -383,7 +389,7 @@ The chatbot includes a library of 16 pre-configured prompt templates organized i
 
 **New Files:**
 - `prompt_manager.py`: Core template system with PromptTemplate and PromptTemplateManager classes
-- `prompt_templates.json`: Configuration file with 16 templates and field definitions
+- `prompt_templates.json`: Configuration file with 18 templates and field definitions
 
 **UI Integration (app.py):**
 - Category and prompt selection with auto-population of choices
