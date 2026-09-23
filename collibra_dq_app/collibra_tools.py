@@ -265,6 +265,36 @@ def _rule_entries(rule_nm: str, before: dict[str, Any], after: dict[str, Any]) -
 
 _RULE_NAME_PATTERN = re.compile(r"if_[a-z0-9]+(?:_[a-z0-9]+)*")
 
+# Collibra's /v3/rules POST does not default these server-side -- a payload missing them
+# (or sending isActive as a JSON boolean) is rejected with a 500.
+_NEW_RULE_DEFAULTS: dict[str, Any] = {
+    "points": 1,
+    "perc": 1,
+    "isActive": 1,
+    "previewLimit": 6,
+    "runTimeLimit": 30,
+    "scoringScheme": 0,
+    "tolerance": 0,
+    "weight": "LOW",
+    "businessCategory": "",
+    "businessDesc": "",
+    "filterQuery": "",
+    "suppressed": False,
+    "ruleRepo": "",
+}
+
+
+def _normalize_rule_payload(rule: dict[str, Any]) -> dict[str, Any]:
+    """Fill in the fields Collibra requires on /v3/rules and coerce the types it rejects."""
+    normalized = {**_NEW_RULE_DEFAULTS, **rule}
+    if isinstance(normalized.get("isActive"), bool):
+        normalized["isActive"] = int(normalized["isActive"])
+    if normalized.get("ruleRepo") is None:
+        normalized["ruleRepo"] = ""
+    if normalized.get("filterQuery") is None:
+        normalized["filterQuery"] = ""
+    return normalized
+
 
 def _validate_new_rule_best_practices(rule_payload: dict[str, Any]) -> list[str]:
     """Best-practice checks for a brand-new custom rule. Never applied to an existing rule,
@@ -316,6 +346,8 @@ def _highlight_diff(before: Optional[str], after: Optional[str]) -> str:
     before_lines = (before or "").splitlines()
     after_lines = (after or "").splitlines()
     diff = list(difflib.unified_diff(before_lines, after_lines, lineterm=""))
+    # The ---/+++ filename headers are meaningless here and Jira renders them as markup.
+    diff = [line for line in diff if not line.startswith(("---", "+++"))]
     if not diff:
         return "  (no textual difference detected)"
     if len(diff) > _MAX_DIFF_LINES:
@@ -338,9 +370,17 @@ def _format_jira_change_description(
         "",
     ]
     for category, item, before, after in entries:
-        if item.endswith(".Rule_value"):
+        if item.endswith(".Rule_value") and before is not None:
             lines.append(f"- [{category}] {item} (diff):")
             lines.append(_highlight_diff(_stringify(before), _stringify(after)))
+        elif item.endswith(".Rule_value"):
+            # New rule: there is nothing to diff against, so show the value as-is.
+            after_str = _stringify(after)
+            if "\n" in after_str:
+                lines.append(f"- [{category}] {item} (new):")
+                lines.extend(f"  {line}" for line in after_str.splitlines())
+            else:
+                lines.append(f"- [{category}] {item}: (new) {after_str}")
         else:
             lines.append(f"- [{category}] {item}: {_stringify(before)} -> {_stringify(after)}")
     return "\n".join(lines)
@@ -418,21 +458,6 @@ def _log_change_entries(
 
     result["jira_pending"] = _queue_jira_entries(region, dataset, entries, change_reason, change_by)
     return result
-
-
-def _find_pending_rule_change(region: str, dataset: str) -> Optional[str]:
-    """Return the change_id of an unexpired pending 'upsert_rule' change for this dataset, if any."""
-    region = _resolve_region(region)
-    now = time.time()
-    for cid, change in _pending_changes.items():
-        if (
-            change["action"] == "upsert_rule"
-            and change["region"] == region
-            and change["dataset"] == dataset
-            and now - change["created_at"] <= _CHANGE_TTL_SECONDS
-        ):
-            return cid
-    return None
 
 
 # ----------------------------------------------------------------------
@@ -808,6 +833,195 @@ def check_link_id_uniqueness(cluster: str, db_mn: str, table_mn: str, link_id: l
         link_id: Candidate key columns.
     """
     return redshift_connections.check_link_id_uniqueness(cluster, db_mn, table_mn, link_id)
+
+
+@tool
+def profile_dataset(cluster: str, db_mn: str, table_mn: str) -> dict[str, Any]:
+    """Profile a Redshift table, returning column-level statistics.
+    Use this tool to profile a redshift table to obtain table-level overview for new dataset set-up.
+
+    Args:
+        cluster: "local" or "region" (as returned by suggest_dataset_name).
+        db_mn: Redshift schema name.
+        table_mn: Redshift table name.
+        returned example:
+            {
+                'cluster': 'region',
+                'db_mn': 'cn',
+                'table_mn': 'dm_angen_brand_health_cn',
+                'row_count': 5026,
+                'column_count': 4,
+                'columns': ['year_month', 'geography_lvl1', 'patient_number', 'inserted_date'],
+                'data_types': {
+                    'year_month': 'date',
+                    'geography_lvl1': 'character varying',
+                    'patient_number': 'numeric',
+                    'inserted_date': 'timestamp without time zone'
+                }
+            }
+    """
+    return redshift_connections.profile_table(cluster, db_mn, table_mn)
+
+
+@tool
+def profile_columns(cluster: str, db_mn: str, table_mn: str, column_names: list[str]) -> list[dict[str, Any]]:
+    """Profile specific columns of a Redshift table, returning column-level statistics.
+    Use this tool to profile specific columns of an existing redshift table for new dataset set-up.
+
+    Args:
+        cluster: "local" or "region" (as returned by suggest_dataset_name).
+        db_mn: Redshift schema name.
+        table_mn: Redshift table name.
+        column_names: List of column names to profile.
+        returned list of column-level statistics example:
+        [
+            {
+                'cluster': 'region',
+                'db_mn': 'cn',
+                'table_mn': 'dm_angen_brand_health_cn',
+                'column_name': 'year_month',
+                'distinct_count': 42,
+                'null_fraction': 0.0,
+                'max_value': datetime.date(2026, 6, 1),
+                'min_value': datetime.date(2023, 1, 1)
+            }
+        ]
+    """
+    return redshift_connections.profile_columns(cluster, db_mn, table_mn, column_names)
+
+
+@tool
+def get_delta_profile(dataset: str, run_date: str) -> list[dict[str, Any]]:
+    """
+    Retrieve the delta profile for a given existing dataset and run date.
+    This is useful for understanding the changes in the dataset profile between 
+    different runs when analyzing the adaptive rule breaks.
+    Delta profile is normalized to a ready-to-use format.
+
+    Args:
+        dataset: The dataset identifier.
+        run_date: The run date of the dataset.
+
+    Returns:
+        list[dict[str, Any]]: The delta profile as a normalized dictionary for all fields.
+        The returned list contains normalized delta profile records for each field, 
+        example of a single element, note that if 'passed' is False, it indicates a adaptive rule break:
+    {
+        'dataset': 'ds_ods_jp_itg_mdm_employee',
+        'column': 'modified_by',
+        'run_id': '2026-09-11T16:00:00.000+0000',
+        'data_type': 
+        {
+            'historical': 'String',
+            'current': 'String',
+            'detected': 'String',
+            'changed': False
+        },
+        'current_profile': 
+        {
+            'null_percent': 0.0,
+            'empty_percent': 0.0,
+            'filled_percent': 100.0,
+            'distinct_count': 10.0,
+            'distinct_ratio': 0.0005075111652456354,
+            'minimum': 'AIwata2',
+            'maximum': 'system',
+            'mean': None,
+            'actual_data_type': 'String',
+            'pass_fail': 0
+        },
+        'baseline_profile': 
+        {
+            'average_null_percent': 0.0,
+            'average_empty_percent': 0.0,
+            'average_filled_percent': 100.0,
+            'average_distinct_count': 9.0,
+            'median_distinct_count': 9.0,
+            'average_distinct_ratio': 0.00045695590498241365,
+            'median_distinct_ratio': 0.00045696877380045696,
+            'average_numeric_min': 0.0,
+            'average_numeric_max': 0.0,
+            'average_numeric_mean': 0.0
+        },
+        'delta': 
+        {
+            'datatype': 0.0,
+            'null': 0.0,
+            'empty': 0.0,
+            'distinct_count': 1.0,
+            'distinct_percent': 11.11,
+            'overall': 0.0,
+            'overall_with_uniques': 11.11
+        },
+        'generated_failure_condition': None,
+        'schema_metadata': 
+        {
+            'is_key': 0,
+            'is_pii': 0,
+            'is_mnpi': 0,
+            'is_masked': 0,
+            'enabled': False
+        },
+        'passed': False
+    }
+    """
+    delta_profile = CollibraDQClient.get_profile_delta(dataset, run_date)
+    delta_profile_norm = [
+        CollibraDQClient.normalize_profile_delta_record(record)
+        for record in delta_profile
+    ]
+
+    return delta_profile_norm
+
+@tool
+def get_topn_bottomn_profile(
+    dataset: str, 
+    run_date: str, 
+    column_names: list[str] = []
+    ) -> dict[str, Any]:
+    """
+    Retrieve the topN-bottomN sorted records for a given dataset and run date.
+    column_names is optional. If not provided, the topN-bottomN will be retrieved for all columns.
+    Final record is normalized in a ready-to-use format.
+
+    Args:
+        dataset: The dataset identifier.
+        run_date: The run date of the dataset.
+        column_names: List of column names to retrieve topN-bottomN for.
+
+    Returns:
+        dict[str, Any]: The topN-bottomN as a normalized dictionary for all fields, such as:
+    {
+        'dataset': 'ds_ods_jp_itg_mdm_employee',
+        'columns': ['cost_center'],
+        'run_id': '2026-09-09T16:00:00.000+0000',
+        'profile_type': 'TOPN',
+        'generated_at': '2026-09-10T02:08:36.929+0000',
+        'cost_center': [
+            {'value': None, 'count': 11189},
+            {'value': 'JPE8508', 'count': 330},
+            {'value': 'JPE8103', 'count': 282},
+            {'value': 'JPE8101', 'count': 275},
+            {'value': 'JP73003', 'count': 203},
+            {'value': 'E8662(NPP)', 'count': 1},
+            {'value': 'JPE8688', 'count': 1},
+            {'value': 'JPE9075', 'count': 1},
+            {'value': 'JPE9324', 'count': 1},
+            {'value': 'JPE8297', 'count': 1}
+        ]
+    }
+    """
+    if column_names:
+        profile = []
+        for column_name in column_names:
+            profile.append(
+                CollibraDQClient.get_topn_bottomn_by_field(dataset, run_date, column_name)
+                )
+    else:
+        profile = CollibraDQClient.get_topn_bottomn_sorted(dataset, run_date)
+    profile_norm = CollibraDQClient.normalize_topn_bottomn(profile)
+
+    return profile_norm
 
 
 @tool
@@ -1283,29 +1497,53 @@ def propose_profile_settings_update(
 
 
 @tool
+def analyze_rule_change(
+    dataset: str,
+    template_rules: list[dict[str, Any]],
+    region: str = "apac",
+    ):
+    """
+    Analyze dataset columns where rules will be applied and potential impacts of the proposed changes.
+    Profile the columns of the dataset to understand the value distributions such as uniqueness, null ratios, 
+    and other relevant statistics, by running sql queries against the dataset tables.
+    Propose custom DQ rule changes based on the analysis, using appropriate template rules available or creating
+    new custom rules as needed.
+    Test the proposed rule changes against the dataset to ensure they behave as expected and flag out any issues.
+
+    
+    """
+    rule_payload = {}
+    return {"rule_payload": rule_payload}
+
+
+@tool
 def propose_rule_change(
     dataset: str,
-    rule_payload: dict[str, Any],
+    rule_payloads: list[dict[str, Any]],
     old_rule_nm: Optional[str] = None,
     region: str = "apac",
 ) -> dict[str, Any]:
-    """Preview creating a new custom DQ rule, updating an existing one, or renaming one, for
-    a dataset (POST /v3/rules -- Collibra uses the same POST endpoint for both create and
+    """Preview creating new custom DQ rules, updating existing ones, or renaming one, for a
+    dataset (POST /v3/rules -- Collibra uses the same POST endpoint for both create and
     update, matched by dataset+ruleNm). This does NOT write anything -- it returns a diff, a
     change_id, and (for brand-new rules only) any best_practice_issues. Show it to the user
     and only call apply_dataset_change after they explicitly confirm.
 
-    rule_payload must include "ruleNm" (the rule's name after this change). To rename an
-    existing rule, pass its current name as old_rule_nm and the new name in
-    rule_payload["ruleNm"] -- there is no rename endpoint, so applying this deletes the old
-    rule and creates a new one under the new name (DELETE + POST /v3/rules), then still
-    triggers one job run. Leave old_rule_nm unset to create a brand-new rule or update an
-    existing one in place (matched against get_dataset_rules by rule_payload["ruleNm"]).
-    Any other rule fields you omit are kept from the existing rule when updating/renaming;
-    "dataset" is set automatically. See the sample schema returned by get_dataset_rules for
-    the full set of fields (ruleType, ruleValue, columnName, businessCategory, businessDesc,
-    dimId, dimName, isActive, points, perc, filterQuery, tolerance, purpose, suppressed,
-    etc.).
+    Pass EVERY rule you want to change for this dataset in one call via `rule_payloads`.
+    They are covered by a single change_id, so one apply_dataset_change writes them all and
+    triggers exactly one job run. Do not call this tool once per rule.
+
+    Each entry in rule_payloads must include "ruleNm" (that rule's name after the change).
+    To rename an existing rule, pass its current name as old_rule_nm and the new name in
+    the payload's "ruleNm" -- there is no rename endpoint, so applying this deletes the old
+    rule and creates a new one under the new name (DELETE + POST /v3/rules). A rename
+    affects exactly one rule, so old_rule_nm may only be used with a single payload. Leave
+    old_rule_nm unset to create brand-new rules or update existing ones in place (matched
+    against get_dataset_rules by "ruleNm"). Any other rule fields you omit are kept from the
+    existing rule when updating/renaming; "dataset" is set automatically. See the sample
+    schema returned by get_dataset_rules for the full set of fields (ruleType, ruleValue,
+    columnName, businessCategory, businessDesc, dimId, dimName, isActive, points, perc,
+    filterQuery, tolerance, purpose, suppressed, etc.).
 
     Best practices enforced for NEW rules only (never for updates or renames of an existing
     rule):
@@ -1336,84 +1574,107 @@ def propose_rule_change(
 
     A custom rule is not part of the DatasetDef, so this proposal is tracked separately
     from propose_dataset_update/propose_profile_settings_update -- but applying it still
-    triggers a job run so the rule takes effect for the next validation. If another rule
-    change is already pending for this dataset, it is bundled into the same change_id so
-    one apply_dataset_change still only triggers a single job run.
+    triggers a job run so the rule takes effect for the next validation.
 
     Args:
-        dataset: Exact Collibra DQ dataset name the rule belongs to.
-        rule_payload: Rule fields to create/update/rename; must include "ruleNm" (the name
-            after this change).
+        dataset: Exact Collibra DQ dataset name the rules belong to.
+        rule_payloads: One entry per rule to create/update/rename; each must include
+            "ruleNm" (that rule's name after this change). Pass all of the dataset's rule
+            changes here in a single call.
         old_rule_nm: Set this to the rule's current ruleNm only when renaming it (i.e. when
-            rule_payload["ruleNm"] differs from the rule's current name). Leave unset
-            otherwise.
+            the payload's "ruleNm" differs from the rule's current name), and only when
+            rule_payloads holds that single rule. Leave unset otherwise.
         region: "apac" or "cn".
     """
-    rule_nm = (rule_payload or {}).get("ruleNm")
-    if not rule_nm:
-        raise ValueError("rule_payload must include 'ruleNm'.")
+    if isinstance(rule_payloads, dict):
+        rule_payloads = [rule_payloads]
+    if not rule_payloads:
+        raise ValueError("rule_payloads must contain at least one rule.")
+    if old_rule_nm and len(rule_payloads) > 1:
+        raise ValueError(
+            "old_rule_nm renames a single rule -- propose the rename on its own, then "
+            "propose the remaining rules in a separate call."
+        )
 
     region = _resolve_region(region)
     client = _get_client(region)
     existing_rules = client.get_rules_for_dataset(dataset) or []
-    lookup_nm = old_rule_nm or rule_nm
-    existing_rule = next((r for r in existing_rules if r.get("ruleNm") == lookup_nm), None)
-    if old_rule_nm and not existing_rule:
-        raise ValueError(f"No existing rule named '{old_rule_nm}' found on dataset '{dataset}' to rename.")
-    is_rename = bool(old_rule_nm and old_rule_nm != rule_nm)
-    if is_rename and any(r.get("ruleNm") == rule_nm for r in existing_rules):
-        raise ValueError(f"A rule named '{rule_nm}' already exists on dataset '{dataset}' -- choose a different name.")
 
-    merged_rule = {**(existing_rule or {}), **rule_payload, "dataset": dataset}
-    diff = _diff_summary(existing_rule or {}, merged_rule)
-    is_update = existing_rule is not None
-    best_practice_issues = [] if is_update else _validate_new_rule_best_practices(merged_rule)
-    requires_validation = is_update and (existing_rule or {}).get("ruleValue") != merged_rule.get("ruleValue")
+    entries = []
+    diffs = []
+    best_practice_issues: dict[str, list[str]] = {}
+    rules_requiring_validation = []
+    new_rules = []
+    is_rename = False
 
-    entry = {
-        "rule": merged_rule,
-        "is_update": is_update,
-        "before": existing_rule,
-        "delete_rule_nm": old_rule_nm if is_rename else None,
-        "requires_validation": requires_validation,
-    }
+    for payload in rule_payloads:
+        rule_nm = (payload or {}).get("ruleNm")
+        if not rule_nm:
+            raise ValueError("Every entry in rule_payloads must include 'ruleNm'.")
 
-    existing_id = _find_pending_rule_change(region, dataset)
-    if existing_id:
-        change = _pending_changes[existing_id]
-        rules = [
-            r
-            for r in change["payload"]["rules"]
-            if r["rule"].get("ruleNm") != rule_nm and r.get("delete_rule_nm") != old_rule_nm
-        ]
-        rules.append(entry)
-        change["payload"]["rules"] = rules
-        change["diff"] = diff
-        change["created_at"] = time.time()
-        change_id = existing_id
-    else:
-        current_def = client.get_dataset_def(dataset) or {}
-        change_id = _stash_change("upsert_rule", region, dataset, {"rules": [entry]}, diff)
-        _pending_changes[change_id]["run_date"] = current_def.get("runId")
+        lookup_nm = old_rule_nm or rule_nm
+        existing_rule = next((r for r in existing_rules if r.get("ruleNm") == lookup_nm), None)
+        if old_rule_nm and not existing_rule:
+            raise ValueError(f"No existing rule named '{old_rule_nm}' found on dataset '{dataset}' to rename.")
+        renaming = bool(old_rule_nm and old_rule_nm != rule_nm)
+        if renaming and any(r.get("ruleNm") == rule_nm for r in existing_rules):
+            raise ValueError(f"A rule named '{rule_nm}' already exists on dataset '{dataset}' -- choose a different name.")
+        is_rename = is_rename or renaming
 
-    message = "Review the diff with the user. Call apply_dataset_change(change_id) only after they confirm."
+        merged_rule = {**(existing_rule or {}), **payload, "dataset": dataset}
+        is_update = existing_rule is not None
+        if not is_update:
+            merged_rule = _normalize_rule_payload(merged_rule)
+            new_rules.append(rule_nm)
+            issues = _validate_new_rule_best_practices(merged_rule)
+            if issues:
+                best_practice_issues[rule_nm] = issues
+        requires_validation = is_update and (existing_rule or {}).get("ruleValue") != merged_rule.get("ruleValue")
+        if requires_validation:
+            rules_requiring_validation.append(rule_nm)
+
+        diff = _diff_summary(existing_rule or {}, merged_rule)
+        diffs.append(f"[{rule_nm}]\n{diff}")
+        entries.append(
+            {
+                "rule": merged_rule,
+                "is_update": is_update,
+                "before": existing_rule,
+                "delete_rule_nm": old_rule_nm if renaming else None,
+                "requires_validation": requires_validation,
+            }
+        )
+
+    combined_diff = "\n".join(diffs)
+    current_def = client.get_dataset_def(dataset) or {}
+    change_id = _stash_change("upsert_rule", region, dataset, {"rules": entries}, combined_diff)
+    _pending_changes[change_id]["run_date"] = current_def.get("runId")
+
+    message = (
+        f"Review the diff for all {len(entries)} rule(s) with the user. Call "
+        "apply_dataset_change(change_id) only after they confirm -- one call writes every "
+        "rule in this proposal and triggers a single job run."
+    )
     if is_rename:
-        message += f" This renames '{old_rule_nm}' to '{rule_nm}' (deletes the old rule, creates the new one)."
-    if requires_validation:
+        message += f" This renames '{old_rule_nm}' (deletes the old rule, creates the new one)."
+    if rules_requiring_validation:
         message += (
-            " ruleValue changed -- after applying, wait for the triggered job to finish, "
-            "then call validate_rule_run(dataset, ruleNm, run_date) to confirm the rule "
-            "passes before telling the user the change is done."
+            f" ruleValue changed for {', '.join(rules_requiring_validation)} -- after "
+            "applying, wait for the triggered job to finish, then call "
+            "validate_rule_run(dataset, ruleNm, run_date) for each to confirm they pass "
+            "before telling the user the change is done."
         )
 
     return {
         "change_id": change_id,
         "dataset": dataset,
         "region": region,
-        "will_create_new_rule": not is_update,
+        "rules": [e["rule"].get("ruleNm") for e in entries],
+        "new_rules": new_rules,
         "will_rename_from": old_rule_nm if is_rename else None,
-        "requires_run_validation": requires_validation,
-        "diff": diff,
+        "requires_run_validation": bool(rules_requiring_validation),
+        "rules_requiring_validation": rules_requiring_validation,
+        "diff": combined_diff,
         "best_practice_issues": best_practice_issues,
         "message": message,
     }
@@ -1655,9 +1916,20 @@ def apply_dataset_change(change_id: str, change_reason: str) -> dict[str, Any]:
     elif change["action"] == "upsert_rule":
         results = []
         deleted_rules = []
+        rule_errors: dict[str, str] = {}
+        applied_entries = []
+        failed_entries = []
         for entry in change["payload"]["rules"]:
+            rule_nm = entry["rule"].get("ruleNm")
             # Collibra has no separate PUT for rules; POST handles both create and update.
-            results.append(client.create_rule(entry["rule"]))
+            # One rejected rule must not abort the rest of the batch.
+            try:
+                results.append(client.create_rule(entry["rule"]))
+            except Exception as exc:
+                rule_errors[rule_nm] = str(exc)
+                failed_entries.append(entry)
+                continue
+            applied_entries.append(entry)
             delete_nm = entry.get("delete_rule_nm")
             if delete_nm:
                 # Renaming: no rename endpoint, so the old rule is deleted once the new
@@ -1669,12 +1941,30 @@ def apply_dataset_change(change_id: str, change_reason: str) -> dict[str, Any]:
                     outcome.setdefault("delete_rule_errors", {})[delete_nm] = str(exc)
         outcome = {
             **outcome,
-            "status": "applied",
+            "status": "applied" if not rule_errors else ("partially applied" if applied_entries else "not applied"),
             "action": "upsert_rule",
             "dataset": dataset,
             "rules": results,
             "deleted_rules": deleted_rules,
         }
+        if rule_errors:
+            # Keep the rejected rules proposable under a fresh change_id so the user does
+            # not have to re-propose the whole batch after a server-side rejection.
+            retry_id = _stash_change(
+                "upsert_rule", region, dataset, {"rules": failed_entries}, change["diff"]
+            )
+            _pending_changes[retry_id]["run_date"] = change["run_date"]
+            outcome["rule_errors"] = rule_errors
+            outcome["failed_rules"] = list(rule_errors)
+            outcome["retry_change_id"] = retry_id
+            outcome["retry_message"] = (
+                f"{len(rule_errors)} rule(s) were rejected by Collibra: {', '.join(rule_errors)}. "
+                "Show the user the exact error text above, fix the offending rule payload with "
+                "propose_rule_change, or re-apply the unchanged ones with "
+                f"apply_dataset_change('{retry_id}'). Do not claim these rules were created."
+            )
+        if not applied_entries:
+            return outcome
         try:
             outcome["job_run"] = client.run_job(dataset, change["run_date"])
             print(f"Triggered job run for dataset '{dataset}' with runId '{change['run_date']}'.")
@@ -1683,7 +1973,7 @@ def apply_dataset_change(change_id: str, change_reason: str) -> dict[str, Any]:
             print(f"Failed to trigger job run for dataset '{dataset}': {exc}")
         entries = []
         rules_requiring_validation = []
-        for entry in change["payload"]["rules"]:
+        for entry in applied_entries:
             rule_nm = entry["rule"].get("ruleNm")
             entries.extend(_rule_entries(rule_nm, entry.get("before") or {}, entry["rule"]))
             if entry.get("requires_validation"):
@@ -1987,7 +2277,9 @@ ALL_TOOLS = [
     get_dataset_change_history,
     get_dataset_definition,
     get_dataset_rules,
+    get_delta_profile,
     get_dq_findings,
+    get_topn_bottomn_profile,
     list_available_metatags,
     list_business_units,
     list_datasets,
@@ -1995,6 +2287,8 @@ ALL_TOOLS = [
     list_rules,
     list_s3_objects,
     list_template_rules,
+    profile_columns,
+    profile_dataset,
     propose_alert_update,
     propose_boundary_suppress,
     propose_business_unit_assignment,
