@@ -244,7 +244,7 @@
       "category": "Custom Rules",
       "title": "Create DQ Custom Rule",
       "description": "Define a new custom data quality rule",
-      "template": "I want to create a new DQ custom rule for dataset '{dataset_name}'. Rule description: '{rule_desc}'. SQL condition: '{rule_sql}'.",
+      "template": "I want to create a new DQ custom rule for dataset '{dataset_name}', column '{column_name}'. Rule dimension: '{rule_dimension}'. Rule description: '{rule_desc}'. SQL condition: '{rule_sql}'.",
       "fields": [
         {
           "name": "dataset_name",
@@ -254,6 +254,28 @@
           "placeholder": "e.g., ds_conn_s3_x, or anz.itg_account",
           "lookup": "datasets",
           "options": []
+        },
+        {
+          "name": "column_name",
+          "label": "Column Name",
+          "type": "textarea",
+          "required": false,
+          "placeholder": "e.g. brand, market, product, disease_area etc."
+        },
+        {
+          "name": "rule_dimension",
+          "label": "Dimension",
+          "type": "dropdown",
+          "required": false,
+          "placeholder": "Select a rule dimension",
+          "options": [
+            "COMPLETENESS",
+            "TIMELINESS",
+            "UNIQUENESS",
+            "VALIDITY",
+            "CONSISTENCY",
+            "ACCURACY"
+          ]
         },
         {
           "name": "rule_desc",
@@ -308,7 +330,7 @@
       "category": "JIRA Operations",
       "title": "Query JIRA Tickets",
       "description": "Search for and retrieve JIRA tickets",
-      "template": "I want to query JIRA tickets with the following criteria: Project: '{project}'. Status: '{status}'. Search text: '{search_text}'.",
+      "template": "I want to query JIRA tickets with the following criteria: Project: '{project}'. Status: '{status}'. Component: '{component}'. Issue Type: '{issue_type}'. Search text: '{search_text}'.",
       "fields": [
         {
           "name": "project",
@@ -323,6 +345,30 @@
           "type": "text",
           "required": false,
           "placeholder": "e.g., Open, In Progress, Completed"
+        },
+        {
+          "name": "issue_type",
+          "label": "Issue Type",
+          "type": "dropdown",
+          "required": false,
+          "placeholder": "Select an issue type",
+          "options": [
+            "Task",
+            "Sub-task",
+            "Story",
+            "Bug",
+            "Epic",
+            "Improvement",
+            "Spike",
+            "Use case"
+          ]
+        },
+        {
+          "name": "component",
+          "label": "Component",
+          "type": "text",
+          "required": false,
+          "placeholder": "e.g. ANGen, E.AI, MDM, ANGen MAF, Data-Product"
         },
         {
           "name": "search_text",
