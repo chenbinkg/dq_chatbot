@@ -138,13 +138,36 @@ def _require_strands() -> None:
         ) from _IMPORT_ERROR
 
 
-def get_atlassian_mcp_client(tool_filters: Optional[Any] = None) -> "MCPClientType":
+# The Atlassian MCP server advertises ~38 Jira tools (agile boards/sprints, versions,
+# worklogs, attachments, xray, batch operations, delete_issue, etc.), but this app only
+# ever needs investigation (search/read) plus a handful of explicit write actions -- every
+# gateway request re-sends the full tool schema list, so an unfiltered client meaningfully
+# bloats each request's payload for no benefit. Pass tool_filters={} to get_atlassian_mcp_client
+# / get_agent_atlassian_mcp_client explicitly if a caller genuinely needs the full tool set.
+DEFAULT_JIRA_TOOL_FILTERS: dict[str, list[str]] = {
+    "allowed": [
+        "jira_search",
+        "jira_get_issue",
+        "jira_get_all_projects",
+        "jira_get_link_types",
+        "jira_create_issue",
+        "jira_create_issue_link",
+        "jira_add_comment",
+        "jira_get_transitions",
+        "jira_transition_issue",
+        "jira_update_issue",
+    ]
+}
+
+
+def get_atlassian_mcp_client(tool_filters: Optional[Any] = DEFAULT_JIRA_TOOL_FILTERS) -> "MCPClientType":
     """Create an MCPClient connected to the Atlassian MCP server over streamable HTTP.
 
     Args:
         tool_filters: Optional ``strands.tools.mcp.ToolFilters`` restricting which
             tools are loaded, e.g. ``{"allowed": ["jira_get_issue", "jira_search"]}``.
-            Recommended for automated pipelines to keep write tools out of reach.
+            Defaults to DEFAULT_JIRA_TOOL_FILTERS (see above); pass ``{}`` for the
+            full, unfiltered tool set.
     """
     _require_strands()
     if not MCP_ATLASSIAN_URL:
