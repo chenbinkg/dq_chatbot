@@ -3,8 +3,9 @@ import json
 import logging
 import os
 import re
+import time
 import uuid
-from typing import Any, AsyncGenerator
+from typing import Any, AsyncGenerator, Callable, Optional
 
 import requests
 from pydantic import BaseModel, Field
@@ -14,6 +15,64 @@ logger = logging.getLogger(__name__)
 
 class _ToolsUnsupportedError(RuntimeError):
     """Raised when the gateway rejects a native ``tools`` payload."""
+
+
+# The J&J gateway sometimes prepends one of these canned refusal-looking phrases to an
+# otherwise normal, complete answer (observed even mid-conversation, not just on cold
+# start) -- e.g. "Sorry, the model cannot answer this question." immediately followed by
+# real content and tool calls. _strip_canned_prefix() removes just that leading noise so
+# it isn't shown to the user; _post() only retries when NOTHING is left after stripping
+# (i.e. a genuine empty/blocked response), to avoid paying for a wasted extra round trip
+# on the common case where the real answer follows anyway.
+_REFUSAL_PHRASES = (
+    "sorry, the model cannot answer this question",
+    "sorry, the model cannot answer",
+    "i cannot answer",
+    "i'm unable to answer",
+    "i am unable to answer",
+    "i'm not able to answer",
+    "i cannot provide",
+    "i'm not able to help with",
+)
+
+_REFUSAL_PREFIX_RE = re.compile(
+    r"^\s*(?:" + "|".join(re.escape(p) for p in _REFUSAL_PHRASES) + r")[.!]*\s*",
+    re.IGNORECASE,
+)
+
+# The refusal is the gateway's input guardrail scoring the payload, so an identical retry
+# only helps for borderline scores -- keep it short rather than waiting minutes.
+_REFUSAL_BACKOFF_SECONDS = (2, 4)
+
+
+def _looks_like_canned_refusal(text: str) -> bool:
+    lowered = (text or "").strip().lower()
+    return any(phrase in lowered for phrase in _REFUSAL_PHRASES)
+
+
+def _is_pure_canned_refusal(text: str) -> bool:
+    """True if `text` is the canned refusal phrase and nothing else (used by _post's
+    retry decision -- unlike _strip_canned_prefix, this does not fall back to the
+    original text, since we need to detect the "nothing else was said" case here)."""
+    if not text or not _looks_like_canned_refusal(text):
+        return False
+    return not _REFUSAL_PREFIX_RE.sub("", text, count=1).strip()
+
+
+def _strip_canned_prefix(text: str) -> str:
+    """Remove a known canned refusal-looking preamble from the start of `text`, if
+    present. Leaves everything else untouched -- only strips a leading match.
+
+    If nothing is left after stripping (the phrase WAS the entire answer), returns the
+    original text unchanged instead of "" -- an empty string here previously caused
+    _response_to_stream_events/_emit_text_events to silently emit zero content blocks,
+    which the agent loop and UI both showed as no response at all rather than a visible
+    (if unhelpful) reply.
+    """
+    if not text:
+        return text
+    stripped = _REFUSAL_PREFIX_RE.sub("", text, count=1)
+    return stripped if stripped.strip() else text
 
 try:
     from strands.models import Model
@@ -180,15 +239,18 @@ class JNJClaudeGatewayModel(Model):
         )
 
         if tool_specs and self._tools_supported is not False:
+            task, retry_messages = self._start_retry_tracked_call(
+                self._invoke_with_tools,
+                messages,
+                tool_specs,
+                effective_system_prompt,
+                tool_choice,
+                kwargs,
+            )
+            async for progress_event in self._drain_retry_progress(task, retry_messages):
+                yield progress_event
             try:
-                response = await asyncio.to_thread(
-                    self._invoke_with_tools,
-                    messages,
-                    tool_specs,
-                    effective_system_prompt,
-                    tool_choice,
-                    kwargs,
-                )
+                response = task.result()
             except _ToolsUnsupportedError as exc:
                 self._tools_supported = False
                 logger.warning(
@@ -226,15 +288,59 @@ class JNJClaudeGatewayModel(Model):
                 return
 
         # Normal text generation
-        text = await asyncio.to_thread(
-            self._invoke_text,
-            messages,
-            effective_system_prompt,
-            kwargs,
+        task, retry_messages = self._start_retry_tracked_call(
+            self._invoke_text, messages, effective_system_prompt, kwargs
         )
+        async for progress_event in self._drain_retry_progress(task, retry_messages):
+            yield progress_event
+        text = task.result()
 
         async for event in self._emit_text_events(text):
             yield event
+
+    def _start_retry_tracked_call(self, func: Callable[..., Any], *args: Any) -> tuple["asyncio.Task[Any]", "asyncio.Queue[str]"]:
+        """Kick off a blocking gateway call (`func`'s last param must accept an
+        `on_retry` callback) in a worker thread, wiring that callback to a queue this
+        event loop can drain concurrently -- see _drain_retry_progress. Needed because
+        the whole call (incl. the canned-refusal backoff sleeps, up to ~1-2 minutes
+        worst case) otherwise runs silently inside asyncio.to_thread with no visible
+        progress until it fully completes."""
+        loop = asyncio.get_running_loop()
+        retry_messages: "asyncio.Queue[str]" = asyncio.Queue()
+
+        def on_retry(attempt: int, max_attempts: int, delay: float) -> None:
+            loop.call_soon_threadsafe(
+                retry_messages.put_nowait,
+                f"J&J gateway refused the request -- retrying ({attempt}/{max_attempts}, waiting {delay:.0f}s)...",
+            )
+
+        task = asyncio.ensure_future(asyncio.to_thread(func, *args, on_retry))
+        return task, retry_messages
+
+    async def _drain_retry_progress(
+        self, task: "asyncio.Task[Any]", retry_messages: "asyncio.Queue[str]"
+    ) -> AsyncGenerator[dict[str, Any], None]:
+        """Yield a visible reasoningContent stream event for each retry message queued
+        while `task` runs, so the UI shows progress instead of looking hung. Caller
+        reads the actual result via `task.result()` once this generator is exhausted."""
+        while not task.done():
+            get_next = asyncio.ensure_future(retry_messages.get())
+            done, _pending = await asyncio.wait({task, get_next}, return_when=asyncio.FIRST_COMPLETED)
+            if get_next in done:
+                yield self._retry_progress_event(get_next.result())
+            else:
+                get_next.cancel()
+        while not retry_messages.empty():
+            yield self._retry_progress_event(retry_messages.get_nowait())
+
+    @staticmethod
+    def _retry_progress_event(message: str) -> dict[str, Any]:
+        return {
+            "contentBlockDelta": {
+                "contentBlockIndex": 0,
+                "delta": {"reasoningContent": {"text": message + "\n"}},
+            }
+        }
 
     def structured_output(
         self,
@@ -273,6 +379,7 @@ class JNJClaudeGatewayModel(Model):
         messages,
         system_prompt: str | None = None,
         extra_payload: dict[str, Any] | None = None,
+        on_retry: Optional[Callable[[int, int, float], None]] = None,
     ) -> str:
         payload = self._build_payload(
             messages=messages,
@@ -280,8 +387,8 @@ class JNJClaudeGatewayModel(Model):
             extra_payload=extra_payload,
         )
 
-        result = self._post(payload)
-        return self._extract_text(result)
+        result = self._post(payload, on_retry=on_retry)
+        return _strip_canned_prefix(self._extract_text(result))
 
     def _invoke_with_tools(
         self,
@@ -290,6 +397,7 @@ class JNJClaudeGatewayModel(Model):
         system_prompt: str | None,
         tool_choice: dict[str, Any] | None,
         extra_payload: dict[str, Any] | None = None,
+        on_retry: Optional[Callable[[int, int, float], None]] = None,
     ) -> dict[str, Any]:
         """Invoke the gateway with native Anthropic tool calling enabled."""
         payload = self._build_payload(
@@ -301,7 +409,7 @@ class JNJClaudeGatewayModel(Model):
         )
 
         try:
-            return self._post(payload)
+            return self._post(payload, on_retry=on_retry)
         except RuntimeError as exc:
             if self._looks_like_tools_unsupported(str(exc)):
                 raise _ToolsUnsupportedError(str(exc)) from exc
@@ -440,7 +548,12 @@ class JNJClaudeGatewayModel(Model):
 
         return payload
 
-    def _post(self, payload: dict[str, Any]) -> dict[str, Any]:
+    def _post(
+        self,
+        payload: dict[str, Any],
+        _attempt: int = 1,
+        on_retry: Optional[Callable[[int, int, float], None]] = None,
+    ) -> dict[str, Any]:
         url = f"{self.base_url}/model/{self.model_id}/invoke"
 
         headers = {
@@ -466,7 +579,30 @@ class JNJClaudeGatewayModel(Model):
                 f"Body={response.text[:2000]}"
             ) from exc
 
-        return response.json()
+        result = response.json()
+
+        # Only worth retrying when the canned phrase is the WHOLE answer (nothing useful
+        # left after stripping it) -- if real content follows, stripping it at display
+        # time is enough and a further round trip would just waste time for nothing.
+        # Observed in practice: this is a genuine gateway/model cold-start condition that
+        # can take up to roughly a minute to clear (not a quick blip), so the backoff
+        # below is intentionally long -- it only ever fires on the rare pure-refusal case,
+        # never on a normal answer, so it doesn't slow down the common path.
+        extracted = self._extract_text(result)
+        if _attempt <= len(_REFUSAL_BACKOFF_SECONDS) and _is_pure_canned_refusal(extracted):
+            delay = _REFUSAL_BACKOFF_SECONDS[_attempt - 1]
+            max_attempts = len(_REFUSAL_BACKOFF_SECONDS) + 1
+            logger.warning(
+                "J&J gateway returned an empty canned refusal on attempt %d/%d "
+                "(PayloadKeys=%s); retrying in %.0fs.",
+                _attempt, max_attempts, sorted(payload.keys()), delay,
+            )
+            if on_retry:
+                on_retry(_attempt, max_attempts, delay)
+            time.sleep(delay)
+            return self._post(payload, _attempt=_attempt + 1, on_retry=on_retry)
+
+        return result
 
     # ---------------------------------------------------------------------
     # Stream event emitters expected by Strands event loop
@@ -608,7 +744,7 @@ class JNJClaudeGatewayModel(Model):
             block_type = block.get("type")
 
             if block_type == "text":
-                text = block.get("text") or ""
+                text = _strip_canned_prefix(block.get("text") or "")
                 if not text:
                     continue
                 yield {
@@ -814,7 +950,8 @@ class JNJClaudeGatewayModel(Model):
     ) -> str | None:
         parts = []
 
-        if system_prompt:
+        # Strands passes the same prompt in both args; system_prompt_content is authoritative.
+        if system_prompt and not system_prompt_content:
             parts.append(system_prompt)
 
         if system_prompt_content:
@@ -957,22 +1094,15 @@ class JNJClaudeGatewayModel(Model):
     def _extract_json_object(self, text: str) -> dict[str, Any]:
         cleaned = text.strip()
 
+        # Strip a leading canned refusal-looking preamble -- real JSON often still
+        # follows it. Only a genuine refusal (nothing left after stripping) is fatal.
+        cleaned = _strip_canned_prefix(cleaned).strip()
+        if not cleaned:
+            raise ValueError(f"Model refused to answer (content policy). Raw text:\n{text}")
+
         # Remove markdown code fence if the model ignored instructions.
         cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.IGNORECASE)
         cleaned = re.sub(r"\s*```$", "", cleaned)
-
-        # Detect content policy refusals before attempting JSON parse
-        refusal_phrases = (
-            "sorry, the model cannot answer",
-            "i cannot answer",
-            "i'm unable to answer",
-            "i am unable to answer",
-            "i'm not able to answer",
-            "i cannot provide",
-            "i'm not able to help with",
-        )
-        if any(phrase in cleaned.lower() for phrase in refusal_phrases):
-            raise ValueError(f"Model refused to answer (content policy). Raw text:\n{text}")
 
         try:
             parsed = json.loads(cleaned)
