@@ -143,6 +143,9 @@ class CollibraDQClient:
     def get_findings(self, dataset: str, run_date: str) -> dict[str, Any]:
         return self._request("GET", f"/v3/jobs/{dataset}/{run_date}/findings")
 
+    def get_findings_by_job_id(self, job_id: int) -> dict[str, Any]:
+        return self._request("GET", f"/v3/jobs/{job_id}/findings")
+
     def list_rules(self) -> list[dict[str, Any]]:
         return self._request("GET", "/v3/rules") or []
 
@@ -947,9 +950,48 @@ class CollibraDQClient:
         """POST /v3/alerts to configure a dataset alert (e.g. low score email)."""
         return self._request("POST", "/v3/alerts", json=payload)
 
-    def run_job(self, dataset: str, run_date: str) -> dict[str, Any]:
-        """POST /v3/jobs/run to trigger a dataset run so a new definition takes effect."""
-        return self._request("POST", "/v3/jobs/run", params={"dataset": dataset, "runDate": run_date})
+    def get_agent_name(self, agent_id: int) -> Optional[str]:
+        """GET /v2/getagent to resolve an agent id (as found in DatasetDef.agentId.id) to its name."""
+        agent = self._request("GET", "/v2/getagent", params={"agentid": agent_id}) or {}
+        return agent.get("agentName")
+
+    def run_job(self, dataset: str, run_date: str, agent_name: Optional[str] = None) -> dict[str, Any]:
+        """POST /v3/jobs/run to trigger a dataset run so a new definition takes effect.
+
+        If agent_name is not given it is resolved from the dataset's own DatasetDef agentId --
+        without agentName, Collibra falls back to an agent named NO_AGENT and returns 404.
+        """
+        if not agent_name:
+            agent_ref = (self.get_dataset_def(dataset) or {}).get("agentId")
+            agent_id = agent_ref.get("id") if isinstance(agent_ref, dict) else agent_ref
+            if agent_id is not None:
+                agent_name = self.get_agent_name(agent_id)
+        params = {"dataset": dataset, "runDate": run_date}
+        if agent_name:
+            params["agentName"] = agent_name
+        return self._request("POST", "/v3/jobs/run", params=params)
+
+    def get_job_status(self, job_id: int) -> dict[str, Any]:
+        """
+        GET /v3/jobs/{job_id} to retrieve the status of a specific job.
+        sample output:
+        {
+            "jobId": 197272,
+            "jobUuid": "ad165069-860b-4380-8751-a20b00c4bb59",
+            "agentId": 3,
+            "agentUuid": "094bbd32-e516-4004-957f-0150dd01b98d",
+            "dataset": "ds_conn_s3_dq_iconnect_source_jj_anz_consulting_group__c",
+            "runId": "2026-09-27T16:00:00.000+0000",
+            "status": "RUNNING",
+            "activity": "PATTERN",
+            "activityStatus": "RUNNING",
+        }
+        """
+        return self._request("GET", f"/v3/jobs/{job_id}")
+    
+    def get_agents(self) -> list[dict[str, Any]]:
+        """GET /v2/getagents to retrieve the list of all agents."""
+        return self._request("GET", "/v2/getagents") or []
 
     def set_boundary_suppress(
         self,
