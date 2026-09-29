@@ -202,12 +202,13 @@ def build_dataset_def(
     profile = payload.setdefault("profile", {})
     profile["on"] = True
     profile["shape"] = False
+    profile["shapeSensitivity"] = 0.001 # Sensitivity for shape profiling, a small value turns on manual mode
     for flag in PROFILE_ON:
         profile[flag] = True
     for flag in PROFILE_OFF:
         profile[flag] = False
 
-    # Layer rules: shape / outliers / patterns off; dupe only for redshift with linkId.
+    # Layer rules: shape / outliers / patterns off; dupe only with linkId.
     payload["outliers"] = []
     payload["patterns"] = []
     shape = payload.setdefault("shape", {})
@@ -215,14 +216,14 @@ def build_dataset_def(
     shape["columnSettings"] = []
 
     dupe = payload.setdefault("dupe", {})
-    dupe_on = bool(link_id) and source_type == "redshift"
+    dupe_on = bool(link_id)
     dupe["on"] = dupe_on
     dupe["include"] = sorted(link_id) if dupe_on else None
 
     payload["jobSchedule"] = {
         "enabled": True,
         "dataset": dataset,
-        "agentId": payload.get("agentId"),
+        "agentId": payload.get("jobSchedule", {}).get("agentId"),
         "runDateFormat": "yyyy-MM-dd",
         "scheduleFrequency": SCHEDULE_FREQUENCY,
         "scheduleTime": schedule_time,
@@ -261,14 +262,14 @@ def validate_best_practices(payload: dict[str, Any], source_type: str) -> list[s
     if (not payload.get("linkId")) and (not load.get("key")):
         issues.append("linkId / primary keys are not configured")
 
-    if (payload.get("shape") or {}).get("enabled"):
-        issues.append("shape layer must be turned off")
-    if payload.get("outliers"):
-        issues.append("outliers layer must be turned off")
-    if payload.get("patterns"):
-        issues.append("patterns layer must be turned off")
+    # if (payload.get("shape") or {}).get("enabled"):
+    #     issues.append("shape layer must be turned off")
+    # if payload.get("outliers"):
+    #     issues.append("outliers layer must be turned off")
+    # if payload.get("patterns"):
+    #     issues.append("patterns layer must be turned off")
 
-    if source_type == "s3" and (payload.get("dupe") or {}).get("on"):
-        issues.append("dupe rule is only supported for redshift datasets")
+    if not (payload.get("dupe") or {}).get("on"):
+        issues.append("dupe rule should be turned on")
 
     return issues
