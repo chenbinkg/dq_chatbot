@@ -29,6 +29,7 @@ from datetime import datetime, timezone
 from typing import Any, Optional
 
 from strands import tool
+from strands.types.tools import ToolContext
 
 from collibra_dq_client import CollibraDQClient
 import redshift_connections
@@ -124,6 +125,17 @@ BOUNDARY_SUPPRESS_DATASET_METRIC_TYPES = ["ROW_COUNT", "TIME"]
 BOUNDARY_SUPPRESS_METRIC_TYPES = BOUNDARY_SUPPRESS_COLUMN_METRIC_TYPES + BOUNDARY_SUPPRESS_DATASET_METRIC_TYPES
 BOUNDARY_SUPPRESS_GENERIC_ITEM_NAMES = {"ROW_COUNT": "Row Count", "TIME": "Load Time"}
 
+# Collibra's defaults for a dataset that has never had a shape layer configured.
+_DEFAULT_SHAPE: dict[str, Any] = {
+    "enabled": True,
+    "totalScore": 0,
+    "sensitivity": 0.001,
+    "maxPerCol": 20,
+    "maxColSize": 12,
+    "granular": False,
+    "columnSettings": [],
+}
+
 
 
 def _resolve_region(region: str = "") -> str:
@@ -154,6 +166,7 @@ def _stash_change(action: str, region: str, dataset: str, payload: dict[str, Any
         "payload": payload,
         "diff": diff,
         "created_at": time.time(),
+        "session_id": chat_store.get_session_context().get("session_id", ""),
     }
     return change_id
 
@@ -165,6 +178,34 @@ def _pop_valid_change(change_id: str) -> dict[str, Any]:
     if time.time() - change["created_at"] > _CHANGE_TTL_SECONDS:
         raise ValueError(f"change_id '{change_id}' expired ({_CHANGE_TTL_SECONDS // 60} min TTL). Propose the change again.")
     return change
+
+
+def _pending_change_label(change_id: str, change: dict[str, Any]) -> str:
+    """Human-readable one-liner for a pending change, used by list_pending_changes and the
+    UI's batch-approval panel."""
+    action = change["action"]
+    dataset = change["dataset"]
+    if action == "create_full":
+        text = f"Create new dataset '{dataset}'"
+    elif action == "assign_bu":
+        text = f"Assign business unit '{change.get('business_unit_name', '?')}' to '{dataset}'"
+    elif action == "assign_alert":
+        text = f"Set email alert on '{dataset}'"
+    elif action == "update":
+        fields = []
+        for section, item, _old, new in _dataset_def_entries(change.get("base_before") or {}, change.get("payload") or {}):
+            name = item if section == "Profile setting" else item.replace("_", " ").lower()
+            fields.append(f"{name} ({'on' if new else 'off'})" if isinstance(new, bool) else name)
+        text = f"Update DatasetDef {', '.join(fields) + ' ' if fields else ''}fields on '{dataset}'"
+    elif action == "upsert_rule":
+        n = len((change.get("payload") or {}).get("rules") or [])
+        text = f"Add/update {n} custom rule(s) on '{dataset}'"
+    elif action == "boundary_suppress":
+        n = len((change.get("payload") or {}).get("items") or [])
+        text = f"Suppress/unsuppress adaptive rule metric on {n} item(s) of '{dataset}'"
+    else:
+        text = f"{action} on '{dataset}'"
+    return f"[{change_id}] {text} ({change['region']})"
 
 
 def _diff_summary(before: dict[str, Any], after: dict[str, Any]) -> str:
@@ -227,6 +268,14 @@ def _propose_update(region: str, dataset: str, patch: dict[str, Any]) -> dict[st
     return {"change_id": change_id, "diff": diff, "merged": merged, "base_payload": base_payload}
 
 
+def _current_update_base(region: str, dataset: str) -> dict[str, Any]:
+    """The DatasetDef a new patch builds on: the pending 'update' payload if one exists, else the live def."""
+    existing_id = _find_pending_update(region, dataset)
+    if existing_id:
+        return _pending_changes[existing_id]["payload"]
+    return _get_client(region).get_dataset_def(dataset) or {"dataset": dataset}
+
+
 def _stringify(value: Any) -> Optional[str]:
     if value is None:
         return None
@@ -249,7 +298,24 @@ def _dataset_def_entries(before: dict[str, Any], after: dict[str, Any]) -> list[
         old_v, new_v = old_profile.get(key), new_profile.get(key)
         if old_v != new_v:
             entries.append(("Profile setting", key, old_v, new_v))
+
+    old_dupe, new_dupe = before.get("dupe") or {}, after.get("dupe") or {}
+    if bool(old_dupe.get("on")) != bool(new_dupe.get("on")):
+        entries.append(("Dupe layer", "Dupe_layer", old_dupe.get("on"), bool(new_dupe.get("on"))))
+    if (old_dupe.get("include") or []) != (new_dupe.get("include") or []):
+        entries.append(("Dupe layer", "Dupe_layer_columns", old_dupe.get("include"), new_dupe.get("include")))
+
+    old_shape, new_shape = before.get("shape") or {}, after.get("shape") or {}
+    if bool(old_shape.get("enabled")) != bool(new_shape.get("enabled")):
+        entries.append(("Shape layer", "Shape_layer", old_shape.get("enabled"), bool(new_shape.get("enabled"))))
+    old_cols, new_cols = _enabled_shape_columns(old_shape), _enabled_shape_columns(new_shape)
+    if old_cols != new_cols:
+        entries.append(("Shape layer", "Shape_layer_columns", old_cols or None, new_cols or None))
     return entries
+
+
+def _enabled_shape_columns(shape: dict[str, Any]) -> list[str]:
+    return sorted(c["name"] for c in shape.get("columnSettings") or [] if c.get("enabled") and c.get("name"))
 
 
 def _rule_entries(rule_nm: str, before: dict[str, Any], after: dict[str, Any]) -> list[tuple[str, str, Any, Any]]:
@@ -891,7 +957,7 @@ def profile_columns(cluster: str, db_mn: str, table_mn: str, column_names: list[
 
 
 @tool
-def get_delta_profile(dataset: str, run_date: str) -> list[dict[str, Any]]:
+def get_delta_profile(dataset: str, run_date: str, region: str = "apac") -> list[dict[str, Any]]:
     """
     Retrieve the delta profile for a given existing dataset and run date.
     This is useful for understanding the changes in the dataset profile between 
@@ -965,9 +1031,10 @@ def get_delta_profile(dataset: str, run_date: str) -> list[dict[str, Any]]:
         'passed': False
     }
     """
-    delta_profile = CollibraDQClient.get_profile_delta(dataset, run_date)
+    region = _resolve_region(region)
+    delta_profile = _get_client(region).get_profile_delta(dataset, run_date)
     delta_profile_norm = [
-        CollibraDQClient.normalize_profile_delta_record(record)
+        _get_client(region).normalize_profile_delta_record(record)
         for record in delta_profile
     ]
 
@@ -977,7 +1044,8 @@ def get_delta_profile(dataset: str, run_date: str) -> list[dict[str, Any]]:
 def get_topn_bottomn_profile(
     dataset: str, 
     run_date: str, 
-    column_names: list[str] = []
+    column_names: list[str] = [],
+    region: str = "apac",
     ) -> dict[str, Any]:
     """
     Retrieve the topN-bottomN sorted records for a given dataset and run date.
@@ -1011,15 +1079,16 @@ def get_topn_bottomn_profile(
         ]
     }
     """
+    region = _resolve_region(region)
     if column_names:
         profile = []
         for column_name in column_names:
             profile.append(
-                CollibraDQClient.get_topn_bottomn_by_field(dataset, run_date, column_name)
+                _get_client(region).get_topn_bottomn_by_field(dataset, run_date, column_name)
                 )
     else:
-        profile = CollibraDQClient.get_topn_bottomn_sorted(dataset, run_date)
-    profile_norm = CollibraDQClient.normalize_topn_bottomn(profile)
+        profile = _get_client(region).get_topn_bottomn_sorted(dataset, run_date)
+    profile_norm = _get_client(region).normalize_topn_bottomn(profile)
 
     return profile_norm
 
@@ -1042,7 +1111,7 @@ def propose_new_dq_dataset(
     """Preview creating a fully configured new DQ dataset that follows all best practices:
     naming convention, Data Domain + subDomain metaTags, MON-FRI DAILY schedule in
     Asia/Singapore, standard spark sizing, only row/null/empty behaviour checks enabled,
-    shape/outliers/patterns turned off, dupe enabled when a linkId is given (redshift only),
+    dupe enabled when a linkId is given,
     plus the standard "Low Dataset Score" email alert and an initial job run.
 
     This does NOT write anything -- it returns a summary, any best-practice violations, and
@@ -1069,11 +1138,14 @@ def propose_new_dq_dataset(
     """
     source_type = (source_type or "").strip().lower()
     template_name = dataset_builder.REDSHIFT_TEMPLATE if source_type == "redshift" else dataset_builder.S3_TEMPLATE
-
+    region = _resolve_region(region)
     client = _get_client(region)
     template = client.get_dataset_def(template_name)
     if not template:
         raise ValueError(f"Could not load reference template dataset '{template_name}'.")
+
+    agents = client.get_agents()
+    active_agents = [agent for agent in agents if agent["agentName"]!="NO_AGENT"]
 
     payload = dataset_builder.build_dataset_def(
         template=template,
@@ -1089,6 +1161,9 @@ def propose_new_dq_dataset(
         s3_path=s3_path,
         job_description=job_description,
     )
+    if active_agents:
+        # assign the first active agent to the job schedule
+        payload["jobSchedule"]["agentId"] = active_agents[0]["agentId"]
     issues = dataset_builder.validate_best_practices(payload, source_type)
     alert_payload = dataset_builder.build_alert_payload(dataset)
 
@@ -1277,12 +1352,13 @@ def get_dataset_adaptive_rule_definitions(dataset: str) -> dict[str, Any]:
     (Data Type Check, Schema Change, Dupes, Custom Rules, Null Values, Empty Fields,
     Uniqueness, Min, Max, Mean, Outliers, Shapes, Patterns), plus dataset-level fields
     (Run Id, Link Id, Date Filter, Scheduler, business unit info) returned once under
-    dataset_info. Read-only. Use this instead of get_dataset_definition when you need the
-    per-column adaptive rule/check breakdown rather than the raw DatasetDef JSON.
+    dataset_info. Read-only. Use this instead of get_dataset_definition only when you need the
+    per-column adaptive rule (not including layer rules such as outliers, patterns, and shape) 
+    breakdown.
 
     Show the user the full per-column table (col_name, Data Type, Row Count, Execution
-    Time, Data Type Check, Schema Change, Dupes, Custom Rules, Null Values, Empty Fields,
-    Uniqueness, Min, Max, Mean, Outliers, Shapes, Patterns) for every column returned --
+    Time, Data Type Check, Schema Change, Null Values, Empty Fields,
+    Uniqueness, Min, Max, Mean) for every column returned --
     do not collapse it into an aggregate summary unless the user only asked for one.
 
     Args:
@@ -1290,7 +1366,13 @@ def get_dataset_adaptive_rule_definitions(dataset: str) -> dict[str, Any]:
     """
     result = dataset_definitions_reference.get_dataset_definitions(dataset)
     if not result["columns"]:
-        return {"dataset": dataset, "dataset_info": {}, "columns": [], "message": "No dataset definitions found for this dataset."}
+        return {
+            "dataset": dataset, 
+            "dataset_info": {}, 
+            "columns": [], 
+            "message": 
+            "No dataset definitions found for this dataset."
+            }
     return {
         "dataset": dataset,
         "dataset_info": result["dataset_info"],
@@ -1305,31 +1387,63 @@ def get_dataset_adaptive_rule_definitions(dataset: str) -> dict[str, Any]:
 
 
 @tool
-def validate_rule_run(dataset: str, rule_nm: str, run_date: str, region: str = "apac") -> dict[str, Any]:
+def get_job_status_by_id(job_id: int, region: str = "apac") -> dict[str, Any]:
+    """
+    Retrieve the status of a specific job by its jobId.
+    output json looks like this for a running job
+    {
+        "jobId": 197272,
+        "jobUuid": "ad165069-860b-4380-8751-a20b00c4bb59",
+        "agentId": 3,
+        "agentUuid": "094bbd32-e516-4004-957f-0150dd01b98d",
+        "dataset": "ds_conn_s3_dq_iconnect_source_jj_anz_consulting_group__c",
+        "runId": "2026-09-27T16:00:00.000+0000",
+        "status": "RUNNING",
+        "activity": "PATTERN",
+        "activityStatus": "RUNNING",
+    }
+    output looks like this for a finished job:
+    {
+        "jobId": 197278,
+        "jobUuid": "48842f32-b89c-4866-9020-a8c6a781c203",
+        "agentId": 3,
+        "agentUuid": "094bbd32-e516-4004-957f-0150dd01b98d",
+        "dataset": "ds_redshift_region_tw_dm_tw_sales_monthly",
+        "runId": "2026-09-27T16:00:00.000+0000",
+        "status": "FINISHED",
+        "activity": null,
+        "activityStatus": null
+    }
+    """
+    return _get_client(region).get_job_status(job_id)
+
+@tool
+def validate_rule_run(dataset: str, rule_nm: str, job_id: int, region: str = "apac") -> dict[str, Any]:
     """Check whether one custom rule passed on a specific job run (GET
-    /v3/jobs/{dataset}/{run_date}/findings, then looks up rule_nm in the "rules" list).
+    /v3/jobs/{jobId}/findings, then looks up rule_nm in the "rules" list).
     Call this after apply_dataset_change on a propose_rule_change whose ruleValue changed
     (requires_run_validation=True) -- give the triggered job time to finish first, since
     findings for a run that hasn't completed yet won't include this rule. Not needed for a
     rename-only change or edits to dimension/description/purpose/other metadata, since
     those don't change what the rule evaluates.
+    job run time can be retrieved from the API output runTime field.
 
     Args:
         dataset: Exact Collibra DQ dataset name.
         rule_nm: The rule's current ruleNm (its new name, if this followed a rename) to look
             up in the run's findings.
-        run_date: The run_date the job was triggered with -- e.g. apply_dataset_change's
-            "run_date" field, or the dataset's latest runId from get_dataset_definition.
+        job_id: The ID of the job that was triggered -- e.g. returned from apply_dataset_change.
         region: "apac" or "cn".
     """
-    findings = _get_client(region).get_findings(dataset, run_date) or {}
+    findings = _get_client(region).get_findings_by_job_id(job_id) or {}
     rules = findings.get("rules") or []
+    run_date = findings.get("runDate") or "unknown"
     match = next((r for r in rules if r.get("ruleNm") == rule_nm), None)
     if match is None:
         return {
             "dataset": dataset,
             "rule_nm": rule_nm,
-            "run_date": run_date,
+            "job_id": job_id,
             "found": False,
             "message": (
                 "This rule has no findings yet for this run -- the job may still be running "
@@ -1341,6 +1455,7 @@ def validate_rule_run(dataset: str, rule_nm: str, run_date: str, region: str = "
         "dataset": dataset,
         "rule_nm": rule_nm,
         "run_date": run_date,
+        "job_id": job_id,
         "found": True,
         "passed": passed,
         "score": match.get("score"),
@@ -1366,6 +1481,102 @@ def list_template_rules(region: str = "apac") -> list[dict[str, Any]]:
     return _get_client(region).list_template_rules()
 
 
+@tool
+def propose_dupes_layer_rule_update(
+    dataset: str,
+    link_id: list[str],
+    region: str = "apac",
+) -> dict[str, Any]:
+    """
+    Configure the dupe layer rule for a given dataset.
+
+    Args:
+        dataset: The dataset identifier.
+        link_id: List of link IDs to include in the dupe rule.
+        region: The region of the Collibra instance.
+
+    Returns:
+        dict[str, Any]: The updated dataset definition payload with dupe layer configuration.
+    """
+    region = _resolve_region(region)
+    link_id = [c for c in link_id or [] if c]
+    dupe = copy.deepcopy(_current_update_base(region, dataset).get("dupe") or {})
+    dupe["on"] = bool(link_id)
+    dupe["include"] = sorted(link_id) if link_id else None
+    result = _propose_update(region, dataset, {"dupe": dupe})
+
+    return {
+        "dataset": dataset,
+        "region": region,
+        "change_id": result["change_id"],
+        "diff": result["diff"],
+        "dupes_payload": dupe,
+        "message": "Review the diff with the user. Call apply_dataset_change(change_id) only after they confirm.",
+    }
+
+
+@tool
+def propose_shape_layer_rule_update(
+    dataset: str,
+    columns_to_enable: Optional[list[str]] = None,
+    columns_to_disable: Optional[list[str]] = None,
+    region: str = "apac",
+) -> dict[str, Any]:
+    """
+    Configure the shape layer rule for a given dataset.
+    Make sure to analyze the dataset columns before enabling the shape rule.
+    shape should apply to columns with consistent and structured data.
+    shape should not be on for columns containing highly mixed or freeform data.
+
+    Args:
+        dataset: The dataset identifier.
+        columns_to_enable: List of columns to enable in the shape rule.
+        columns_to_disable: List of columns to disable in the shape rule.
+        region: The region of the Collibra instance.
+
+    Returns:
+        dict[str, Any]: The updated dataset definition payload with shape layer configuration.
+    """
+    if not columns_to_enable and not columns_to_disable:
+        raise ValueError("Provide columns_to_enable and/or columns_to_disable.")
+    region = _resolve_region(region)
+    shape = copy.deepcopy(_current_update_base(region, dataset).get("shape") or _DEFAULT_SHAPE)
+    settings = {c["name"]: c for c in shape.get("columnSettings") or [] if c.get("name")}
+    requested = [(n, True) for n in columns_to_enable or []] + [(n, False) for n in columns_to_disable or []]
+    unknown = sorted({n for n, _ in requested} - set(settings)) if settings else []
+    if unknown:
+        raise ValueError(f"Unknown shape column(s) {unknown}. Existing columns: {sorted(settings)}")
+    for name, enabled in requested:
+        settings.setdefault(name, {"name": name, "type": ""})["enabled"] = enabled
+    shape["columnSettings"] = list(settings.values())
+    shape["sensitivity"] = 0.001
+    if columns_to_enable:
+        shape["enabled"] = True
+        existing_id = _find_pending_update(region, dataset)
+        if existing_id:
+            current_profile = _pending_changes[existing_id]["payload"].get("profile") or {}
+            # turn on shape profiling in the profile settings which enables layer shape rule
+            current_profile["shapeSensitivity"] = 0.001
+            current_profile["shape"] = True
+        else:
+            current_profile = (_get_client(region).get_dataset_def(dataset) or {}).get("profile") or {}
+            current_profile["shapeSensitivity"] = 0.001
+            current_profile["shape"] = True
+        result_1 = _propose_update(region, dataset, {"profile": current_profile})
+        # result_1 will return a change_id will be the same as the shape update's change_id
+        # since both of them will have the same action "update"
+        # so apply_dataset_change(result_1["change_id"]) will apply both the profile and shape updates
+    result = _propose_update(region, dataset, {"shape": shape})
+
+    return {
+        "dataset": dataset,
+        "region": region,
+        "change_id": result["change_id"],
+        "diff": result["diff"],
+        "shapes_payload": shape,
+        "message": "Review the diff with the user. Call apply_dataset_change(change_id) only after they confirm.",
+    }
+
 # ----------------------------------------------------------------------
 # Write tools: propose (preview) then apply (confirm)
 # ----------------------------------------------------------------------
@@ -1376,10 +1587,12 @@ def propose_dataset_update(
     schedule_time: Optional[str] = None,
     job_description: Optional[str] = None,
     link_id: Optional[list[str]] = None,
+    dupes_payload: Optional[dict[str, Any]] = None,
+    shapes_payload: Optional[dict[str, Any]] = None,
     region: str = "apac",
 ) -> dict[str, Any]:
     """Preview an update to a dataset's definition (metaTags, scheduleTime, jobDescription,
-    linkId, etc.
+    linkId, Dupes, Shape rules, etc.
     ). This does NOT write anything -- it returns a diff and a change_id.
     Show the diff to the user and only call apply_dataset_change after they explicitly
     confirm.
@@ -1394,6 +1607,7 @@ def propose_dataset_update(
         schedule_time: New cron/schedule string, if changing.
         job_description: New job description, if changing.
         region: "apac" or "cn".
+        link_id: New list of link IDs, if changing.
     """
     patch: dict[str, Any] = {}
     if meta_tags is not None:
@@ -1404,6 +1618,10 @@ def propose_dataset_update(
         patch["jobDescription"] = job_description
     if link_id is not None:
         patch["linkId"] = link_id
+    if dupes_payload is not None:
+        patch["dupe"] = dupes_payload
+    if shapes_payload is not None:
+        patch["shape"] = shapes_payload
     if not patch:
         raise ValueError("No fields provided to update.")
 
@@ -1435,6 +1653,10 @@ def propose_profile_settings_update(
     """Preview enabling/disabling a dataset's profile checks. This does NOT write anything --
     it returns a diff and a change_id. Show the diff to the user and only call
     apply_dataset_change after they explicitly confirm.
+    
+    If user requests to turn on the profile setting for a specific column, propose_boundary_suppress
+    tool needs to be used to propose the necessary boundary suppressions for all other columns not 
+    being modified.
 
     Only these profile settings can be changed: behaviorRowCheck, behaviorNullCheck,
     behaviorEmptyCheck, behaviorTimeCheck, behaviorMinValueCheck, behaviorMaxValueCheck,
@@ -1494,26 +1716,6 @@ def propose_profile_settings_update(
         "diff": profile_diff,
         "message": "Review the diff with the user. Call apply_dataset_change(change_id) only after they confirm.",
     }
-
-
-@tool
-def analyze_rule_change(
-    dataset: str,
-    template_rules: list[dict[str, Any]],
-    region: str = "apac",
-    ):
-    """
-    Analyze dataset columns where rules will be applied and potential impacts of the proposed changes.
-    Profile the columns of the dataset to understand the value distributions such as uniqueness, null ratios, 
-    and other relevant statistics, by running sql queries against the dataset tables.
-    Propose custom DQ rule changes based on the analysis, using appropriate template rules available or creating
-    new custom rules as needed.
-    Test the proposed rule changes against the dataset to ensure they behave as expected and flag out any issues.
-
-    
-    """
-    rule_payload = {}
-    return {"rule_payload": rule_payload}
 
 
 @tool
@@ -1629,7 +1831,8 @@ def propose_rule_change(
             issues = _validate_new_rule_best_practices(merged_rule)
             if issues:
                 best_practice_issues[rule_nm] = issues
-        requires_validation = is_update and (existing_rule or {}).get("ruleValue") != merged_rule.get("ruleValue")
+        # Determine if the rule requires validation based on changes to its value.
+        requires_validation = (existing_rule or {}).get("ruleValue") != merged_rule.get("ruleValue")
         if requires_validation:
             rules_requiring_validation.append(rule_nm)
 
@@ -1867,9 +2070,12 @@ def apply_dataset_change(change_id: str, change_reason: str) -> dict[str, Any]:
                 "action": "update",
                 "dataset": dataset,
                 "dataset_def": result,
+                "job_id": "",
+                "message": "jobId if not empty, can be used to track the job run.",
             }
         try:
             outcome["job_run"] = client.run_job(dataset, change["run_date"])
+            outcome["job_id"] = outcome["job_run"]["jobId"]
             print(f"Triggered initial job run for dataset '{dataset}' with runId '{change['run_date']}'.")
         except Exception as exc:
             outcome["job_run_error"] = str(exc)
@@ -1893,6 +2099,8 @@ def apply_dataset_change(change_id: str, change_reason: str) -> dict[str, Any]:
             "action": change["action"],
             "dataset": dataset,
             "dataset_def": result,
+            "job_id": "",
+            "message": "jobId if not empty, can be used to track the job run.",
         }
         try:
             outcome["alert"] = client.create_alert(change["alert_payload"])
@@ -1900,6 +2108,7 @@ def apply_dataset_change(change_id: str, change_reason: str) -> dict[str, Any]:
             outcome["alert_error"] = str(exc)
         try:
             outcome["job_run"] = client.run_job(dataset, change["run_date"])
+            outcome["job_id"] = outcome["job_run"]["jobId"]
             print(f"Triggered initial job run for dataset '{dataset}' with runId '{change['run_date']}'.")
         except Exception as exc:
             outcome["job_run_error"] = str(exc)
@@ -2037,6 +2246,132 @@ def apply_dataset_change(change_id: str, change_reason: str) -> dict[str, Any]:
 
     return outcome
 
+
+@tool(context=True)
+def ask_user_for_input(question: str, fields: list[dict[str, Any]], tool_context: ToolContext) -> dict[str, Any]:
+    """Pause and ask the human one or more concrete values via real form controls in the
+    chat UI (a textbox, time field, or choice buttons/dropdown) instead of asking in your
+    own prose reply and parsing a free-text answer.
+
+    Use this whenever you need specific values from the user before you can proceed --
+    e.g. a new dataset's scheduleTime, confirming or overriding suggested metaTags/
+    business unit, or any other input-gathering step in a workflow (see "Creating a new
+    dataset" step c). Do NOT use this for propose_*/apply_dataset_change confirmations --
+    those already have their own diff + confirm/approve flow (chat "yes" or the Pending
+    Approvals panel); this tool is only for collecting input values the agent still needs
+    before it can call a propose_* tool in the first place.
+
+    Args:
+        question: Short heading shown above the fields, e.g. "A couple of details needed
+            before I can propose this dataset:".
+        fields: One entry per value needed (at most 4 are rendered), each a dict with:
+            - name: key the answer is returned under (e.g. "schedule_time").
+            - label: human-readable label shown next to the control.
+            - type: "text" (free text), "time" (HH:MM:SS), or "choice" (buttons/dropdown --
+              requires "options").
+            - options: required when type is "choice", e.g.
+              ["Confirm as proposed", "I want to override"].
+            - default: optional pre-filled value.
+            - required: whether the field must be answered (default True; informational
+              only, not enforced client-side).
+
+    Returns:
+        {"answers": {field_name: value, ...}} once the human submits the form.
+    """
+    answers = tool_context.interrupt("ask_user_for_input", reason={"question": question, "fields": fields})
+    return {"answers": answers}
+
+
+@tool
+def list_pending_changes(region: str = "") -> dict[str, Any]:
+    """List this chat session's pending (proposed but not yet applied) changes -- every
+    change_id currently valid for apply_dataset_change/apply_pending_changes, with a short
+    human-readable label and how many seconds remain before it expires. Read-only.
+
+    Use this after proposing several related changes in one turn (e.g. a new dataset's
+    DatasetDef, business unit assignment, and custom rules) to show the user everything
+    awaiting confirmation in one place before asking them to confirm the whole plan, or
+    when the user asks "what's still pending" / "what have I not confirmed yet".
+
+    Args:
+        region: Optional -- only list change_ids for "apac" or "cn". Leave empty for both.
+    """
+    session_id = chat_store.get_session_context().get("session_id", "")
+    region = (region or "").strip().lower()
+    now = time.time()
+    items = []
+    for change_id, change in list(_pending_changes.items()):
+        if change.get("session_id") != session_id:
+            continue
+        remaining = _CHANGE_TTL_SECONDS - (now - change["created_at"])
+        if remaining <= 0:
+            continue
+        if region and change["region"] != region:
+            continue
+        items.append(
+            {
+                "change_id": change_id,
+                "label": _pending_change_label(change_id, change),
+                "action": change["action"],
+                "dataset": change["dataset"],
+                "region": change["region"],
+                "diff": change.get("diff") or "",
+                "expires_in_seconds": int(remaining),
+            }
+        )
+    items.sort(key=lambda i: i["expires_in_seconds"])
+    return {"pending_changes": items, "count": len(items)}
+
+
+@tool
+def apply_pending_changes(change_ids: list[str], change_reason: str) -> dict[str, Any]:
+    """Apply multiple previously proposed changes (from propose_*/list_pending_changes) in
+    the given order, in a single call -- e.g. a new dataset's create_full + assign_bu +
+    upsert_rule change_ids together, once the user reviews and confirms the whole plan at
+    once, instead of confirming and applying each one separately.
+
+    Respect dependencies when ordering change_ids -- e.g. a dataset's own create_full
+    change_id must come before its assign_bu or upsert_rule change_ids, since those need
+    the dataset to already exist in Collibra. Stops at the first failure so a bad change
+    doesn't silently get skipped while later ones proceed; change_ids already applied
+    earlier in this same call remain applied.
+
+    Args:
+        change_ids: change_id values, in the order they should be applied.
+        change_reason: Mandatory short reason for the change, shared by every change_id in
+            this call and stored in the audit trail for each of them, same as
+            apply_dataset_change. Ask the user for it before calling this tool.
+    """
+    if not change_ids:
+        raise ValueError("change_ids must contain at least one change_id.")
+    if not change_reason or not change_reason.strip():
+        raise ValueError(
+            "change_reason is required to apply changes. Ask the user for a brief reason "
+            "and call apply_pending_changes again with it -- the change_ids are still valid."
+        )
+    results = []
+    for change_id in change_ids:
+        try:
+            outcome = apply_dataset_change(change_id, change_reason)
+        except Exception as exc:
+            results.append({"change_id": change_id, "status": "error", "error": str(exc)})
+            return {
+                "results": results,
+                "applied": len(results) - 1,
+                "requested": len(change_ids),
+                "status": "stopped_on_error",
+                "message": (
+                    f"Stopped after change_id '{change_id}' failed: {exc}. Earlier change_ids "
+                    "in this call were already applied; later ones were not attempted."
+                ),
+            }
+        results.append({"change_id": change_id, "status": "applied", "outcome": outcome})
+    return {
+        "results": results,
+        "applied": len(results),
+        "requested": len(change_ids),
+        "status": "applied",
+    }
 
 
 @tool
@@ -2268,6 +2603,8 @@ def get_dataset_change_history(
 
 ALL_TOOLS = [
     apply_dataset_change,
+    apply_pending_changes,
+    ask_user_for_input,
     check_link_id_uniqueness,
     data_domain_distribution,
     find_similar_tagged_datasets,
@@ -2279,10 +2616,12 @@ ALL_TOOLS = [
     get_dataset_rules,
     get_delta_profile,
     get_dq_findings,
+    get_job_status_by_id,
     get_topn_bottomn_profile,
     list_available_metatags,
     list_business_units,
     list_datasets,
+    list_pending_changes,
     list_redshift_connections,
     list_rules,
     list_s3_objects,
@@ -2293,10 +2632,12 @@ ALL_TOOLS = [
     propose_boundary_suppress,
     propose_business_unit_assignment,
     propose_dataset_update,
+    propose_dupes_layer_rule_update,
     propose_email_alert,
     propose_new_dq_dataset,
     propose_profile_settings_update,
     propose_rule_change,
+    propose_shape_layer_rule_update,
     sample_s3_file,
     sample_table_data,
     search_redshift_columns,
