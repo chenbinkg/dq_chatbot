@@ -1,0 +1,17 @@
+**/.env
+**/.env.*
+!**/.env.example
+**/__pycache__
+**/*.pyc
+**/*.ipynb
+**/.ipynb_checkpoints
+.git
+.github
+.vscode
+.venv
+.databricks
+.DS_Store
+infra
+scripts
+*.drawio
+*.md
