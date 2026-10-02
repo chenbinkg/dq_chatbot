@@ -1,0 +1,48 @@
+sequenceDiagram
+  autonumber
+  actor U as Super-user
+  participant UI as Gradio (app.py)
+  participant D as _drive_agent_stream
+  participant A as Strands Agent
+  participant M as JNJClaudeGatewayModel
+  participant G as J&J GenAI Gateway
+  participant T as collibra_tools @tool
+  participant MC as MCPClient → Atlassian MCP
+  participant PG as Postgres
+
+  U->>UI: message / starter button / Quick Prompt
+  UI->>UI: set_session_context(user, session_id, region)
+  UI->>A: _ensure_chat_agent(region)
+  UI->>D: drive(prompt, chat_history)
+  D->>A: stream_async(prompt)
+  loop Agent event loop
+    A->>M: stream(messages, tool_specs[46 local + 10 MCP], system_prompt)
+    M->>G: POST /model/{model_id}/invoke (Anthropic "tools")
+    alt gateway canned refusal only
+      G-->>M: "Sorry, the model cannot answer…"
+      M-->>D: reasoning event "retrying (n/N)…"
+      M->>G: retry with backoff
+    end
+    G-->>M: content: text and/or tool_use blocks
+    M-->>A: Converse-style stream events (toolUse / text)
+    A-->>D: current_tool_use → nested "🛠️ Tool calls" row
+    alt local tool
+      A->>T: execute (e.g. get_dataset_definition)
+      T-->>A: tool result (Collibra / Redshift / S3 / PG)
+    else MCP tool
+      A->>MC: call jira_search / jira_get_issue …
+      MC-->>A: tool result
+    else ask_user_for_input
+      T-->>A: tool_context.interrupt(question, fields)
+      A-->>D: result.stop_reason = "interrupt"
+    end
+  end
+  A-->>D: data (final text) + result
+  D-->>UI: chunked answer, status "Completed" / "Waiting for your input"
+  UI->>PG: log_chat_turn(chat_history)
+  UI->>UI: refresh_pending_changes → approvals panel
+  opt Interrupt pending
+    U->>UI: fill form, Submit answers
+    UI->>D: stream_async([{interruptResponse:{interruptId, response}}])
+    Note over A,T: Same agent instance resumes, so the tool re-runs and interrupt() returns the answers
+  end
