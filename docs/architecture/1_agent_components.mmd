@@ -1,0 +1,114 @@
+flowchart LR
+  %% ---------------- UI ----------------
+  subgraph UI["Gradio UI · collibra_dq_app/app.py"]
+    direction TB
+    Login["Login tab<br/>region apac/cn + SUPERUSER_CREDENTIALS"]
+    Chat["Chatbot + message box<br/>starter buttons · Quick Prompts<br/>(prompt_manager + prompt_templates.json)"]
+    IForm["'Agent needs input' form<br/>4 fixed field slots"]
+    Pending["Pending approvals panel<br/>checkboxes + reason"]
+  end
+
+  %% ---------------- Handlers ----------------
+  subgraph H["app.py handlers"]
+    direction TB
+    RA["respond_async"]
+    SIA["submit_interrupt_answers"]
+    APC["apply_selected_pending_changes"]
+    RPC["refresh_pending_changes"]
+    CR["check_resume / resume_previous_chat<br/>_start_fresh_conversation"]
+    DRV["_drive_agent_stream<br/>stream events → chat_history rows<br/>(reasoning · tool calls · answer)"]
+    ENS["_ensure_chat_agent(region)<br/>_build_chat_agent"]
+  end
+
+  %% ---------------- Agent ----------------
+  subgraph AG["Strands Agent · dq_agent.build_agent()  (one global agent per process)"]
+    direction TB
+    SP["System prompt<br/>agent_instruction.txt (or FALLBACK)<br/>+ 'Current login session region: …'"]
+    MEM["agent.messages<br/>seeded 'Hi'+welcome, or rebuilt from Postgres"]
+    LOOP["Event loop<br/>model → toolUse → execute → model … → result"]
+    REG["Tool registry<br/>[*ALL_TOOLS, MCPClient]"]
+    INTS["Interrupt state<br/>(stop_reason == 'interrupt')"]
+  end
+
+  %% ---------------- LLM ----------------
+  subgraph LLM["LLM provider · jnj_strands_model.py"]
+    direction TB
+    JNJ["JNJClaudeGatewayModel(strands Model)<br/>max_tokens 8192 · temp 0.5<br/>native Anthropic tools payload<br/>fallback: prompt-JSON if tools rejected<br/>refusal-prefix strip + retry→reasoning events"]
+    GW["J&J GenAI Gateway<br/>POST /model/global.anthropic.claude-sonnet-4-6/invoke<br/>JNJ_GENAI_API_KEY"]
+  end
+
+  %% ---------------- Custom tools ----------------
+  subgraph CT["Custom @tool functions · collibra_tools.ALL_TOOLS (46)"]
+    direction TB
+    T1["Inspect (read-only)<br/>list_datasets · get_dataset_definition · get_dataset_rules<br/>get_dataset_alert · get_business_unit · list_rules<br/>list_template_rules · list_business_units · list_available_metatags<br/>get_dataset_adaptive_rule_definitions · get_dataset_change_history"]
+    T2["Investigate<br/>get_dq_findings · get_delta_profile · get_topn_bottomn_profile<br/>get_job_status_by_id · validate_rule_run"]
+    T3["Source discovery<br/>list_redshift_connections · search_redshift_tables/columns<br/>sample_table_data · test_redshift_query · profile_dataset<br/>profile_columns · check_link_id_uniqueness<br/>list_s3_objects · sample_s3_file"]
+    T4["Suggest<br/>suggest_metatags · suggest_business_unit · suggest_dataset_name<br/>find_similar_tagged_datasets · data_domain_distribution"]
+    T5["Propose (no write → change_id + diff)<br/>propose_new_dq_dataset · propose_dataset_update · propose_rule_change<br/>propose_profile_settings_update · propose_shape/dupes_layer_rule_update<br/>propose_boundary_suppress · propose_business_unit_assignment<br/>propose_email_alert · propose_alert_update"]
+    T6["Apply (write)<br/>apply_dataset_change · apply_pending_changes · list_pending_changes"]
+    T7["HITL: ask_user_for_input<br/>@tool(context=True) → tool_context.interrupt()"]
+    T8["sync_jira_change_request"]
+    PS[("In-memory stores<br/>_pending_changes (TTL 15 min, session-tagged)<br/>_pending_jira_batches")]
+    CTX[("chat_store contextvar<br/>app_user · session_id · region")]
+  end
+
+  %% ---------------- MCP ----------------
+  subgraph MCP["MCP · strands_agent.get_atlassian_mcp_client()"]
+    direction TB
+    MC["MCPClient (strands.tools.mcp)<br/>streamablehttp_client + X-Atlassian-* headers<br/>tool_filters = 10 jira_* tools"]
+    MS["Atlassian MCP server<br/>atlassian-mcp.xena.dev/mcp/"]
+    MT["MCP tools<br/>jira_search · jira_get_issue · jira_get_all_projects<br/>jira_get_link_types · jira_create_issue · jira_create_issue_link<br/>jira_add_comment · jira_get_transitions<br/>jira_transition_issue · jira_update_issue"]
+  end
+
+  %% ---------------- Backends ----------------
+  subgraph BE["Systems of record"]
+    direction TB
+    CDQ["Collibra DQ REST (APAC / CN)<br/>collibra_dq_client + token_manager<br/>/v2/*, /v3/datasetDefs, /v3/rules, /v3/jobs/run, /v3/alerts"]
+    RS["Redshift clusters (psycopg2)"]
+    S3["S3 (boto3, ranged GET)"]
+    PG["Postgres<br/>dqm_chatbot_chat_history<br/>dqm_chatbot_change_history<br/>dqm_business_unit_mapping"]
+    JIRA["Jira REST (jira_logger, Bearer token)"]
+  end
+
+  Login --> CR
+  Chat --> RA
+  IForm --> SIA
+  Pending --> APC
+  Pending -.-> RPC
+
+  RA --> DRV
+  SIA --> DRV
+  APC --> DRV
+  RA --> ENS
+  CR --> ENS
+  ENS -->|"build_agent(mcp_clients, region)"| AG
+  CR <-->|"get_latest_session"| PG
+  RA -->|"log_chat_turn"| PG
+
+  DRV -->|"agent.stream_async(text | interruptResponse[])"| LOOP
+  LOOP -->|"events: reasoning, current_tool_use, data, result"| DRV
+  SP --> LOOP
+  MEM <--> LOOP
+  LOOP <-->|"messages + tool_specs + system prompt"| JNJ
+  JNJ <--> GW
+  LOOP --> REG
+  LOOP --> INTS
+  REG --> CT
+  REG --> MC
+  MC <--> MS
+  MS --- MT
+  MS --> JIRA
+
+  T1 & T2 & T5 & T6 --> CDQ
+  T3 --> RS
+  T3 --> S3
+  T5 --> PS
+  T6 --> PS
+  T6 -->|"audit rows"| PG
+  T8 --> JIRA
+  T7 -.->|"raises interrupt"| INTS
+  RA & SIA & APC -->|"set_session_context"| CTX
+  CTX -.-> T5 & T6
+
+  APC -->|"direct call, bypasses LLM"| T6
+  RPC -->|"direct call"| T6
