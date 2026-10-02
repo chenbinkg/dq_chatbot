@@ -8,8 +8,8 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /app
 
-COPY collibra_dq_app/requirements.txt collibra_dq_app/requirements.txt
-RUN pip install --upgrade pip && pip install -r collibra_dq_app/requirements.txt
+COPY requirements.txt requirements.txt
+RUN pip install --upgrade pip && pip install -r requirements.txt
 
 COPY jnj_strands_model.py strands_agent.py token_manager.py ./
 COPY collibra_dq_app/ collibra_dq_app/
