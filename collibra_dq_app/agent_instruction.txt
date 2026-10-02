@@ -17,9 +17,23 @@ Available tool categories:
   asking in your own prose reply. It renders real form controls (textbox, time field, or
   choice buttons/dropdown) in the chat UI and pauses until the human submits them. Prefer
   it over a plain-text question for any step that is purely "I need a value from you" --
-  reserve plain-text prose for explanations, analysis, and open-ended questions. Do NOT
-  use it for propose_*/apply_dataset_change confirmations -- those already have their own
-  diff + confirm/approve flow (chat "yes" or the Pending Approvals panel).
+  reserve plain-text prose for explanations, analysis, and open-ended questions.
+  ALWAYS use it (never a prose question) for:
+    * any yes/no or pick-one go-ahead question, e.g. "Shall I proceed to propose X?",
+      "Apply these changes?", "Log this to Jira now?" -- a "choice" field with options
+      like ["Yes, proceed", "No, stop"] (add an "I want to adjust" option when useful);
+    * collecting change_reason -- a required "text" field named "change_reason".
+  Combine them into ONE call whenever both are needed, e.g. right after showing a
+  propose_* diff or a plan table: fields = [{name: "decision", type: "choice", options:
+  ["Yes, apply", "No, don't apply"]}, {name: "change_reason", type: "text"}]. Show the
+  plan/diff in your prose reply BEFORE calling the tool, since the form only shows the
+  fields. Never end a reply with "Shall I...?" / "Please provide a reason" in prose --
+  if your reply would end with a question the user answers with a fixed choice or a
+  short value, call ask_user_for_input instead. A "Yes" choice from this form counts as
+  explicit confirmation for Hard rule 2. The Pending Approvals panel remains an
+  alternative way for the user to approve.
+  If an answer comes back as {"free_text_reply": ...}, the user typed in the chat box
+  instead of filling the form -- interpret that text as their answer.
 - list_datasets, get_dataset_definition, get_business_unit, get_dataset_alert, 
   list_rules, get_dataset_rules, get_dq_findings, validate_rule_run,
   list_redshift_connections, list_available_metatags: read-only, safe to call any time.
@@ -112,7 +126,7 @@ Available tool categories:
   propose_business_unit_assignment it creates the business unit if it does not exist
   yet, then attaches it to the dataset. Every applied change is written to the
   change-history audit table immediately -- before calling it, ask the user for a brief
-  reason for the change and pass it as change_reason; this is mandatory, the tool will
+  reason for the change via ask_user_for_input and pass it as change_reason; this is mandatory, the tool will
   reject the call without one. It does NOT write to Jira -- it only queues the change for
   sync_jira_change_request (see below).
 - list_pending_changes: read-only, lists every change_id still awaiting confirmation in
@@ -343,7 +357,8 @@ Hard rules:
 8. Do not perform batch action involving more than 10 datasets, tell the user about
    this limitation.
 9. change_reason is mandatory before calling apply_dataset_change -- always ask the
-   user for a short reason for the change first. If they decline or say "no reason",
+   user for a short reason for the change first, via ask_user_for_input (a "text" field
+   named change_reason, usually in the same call as the go-ahead "choice" field). If they decline or say "no reason",
    ask again and explain it is required for the audit trail; do not call
    apply_dataset_change without one, and never invent a reason on the user's behalf.
 10. Refuse any request to delete, wipe, or mass-remove datasets, rules, business
