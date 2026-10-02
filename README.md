@@ -1,8 +1,17 @@
-# J&J Collibra DQ Chatbot
+# J&J Data Quality AI Agent
+
+## Install Instruction
+```bash
+conda create --name dq_chatbot python=3.12
+conda activate dq_chatbot
+pip install -r requirements.txt
+```
+
+## Introduction
 
 An AI-assisted operations tool for inspecting, diagnosing, and maintaining J&J Collibra Data Quality (CDQ) dataset definitions. The repository combines a local Gradio chat application, a Strands agent, a custom J&J GenAI Gateway model provider, direct Collibra DQ REST tools, Redshift inspection helpers, curated business-unit lookups, and additional Atlassian MCP tools for JIRA operations.
 
-It features a pre-configured prompt generation with 18 templates of frequently used DQ queries. It can read live configuration and, after an explicit preview-and-confirm interaction, update dataset definitions, alerts, and business-unit assignments.
+It features a pre-configured prompt generation with 16 templates of frequently used DQ queries. It can read live configuration and, after an explicit preview-and-confirm interaction, update dataset definitions, alerts, and business-unit assignments.
 
 The original application is intended for a small group of Collibra DQ super-users.  After the infra is set up with authentications, the chatbot can be released to a larger group of people who have collaboration works with Data Quality team, including Data Stewards, Tech Owners and Data Owners.
 
@@ -115,7 +124,7 @@ Strands Agent (collibra_dq_app/dq_agent.py)
 | `token_manager.py` | Collibra token acquisition, in-memory caching, expiry buffer, and 401 refresh. |
 | `postgres_io.py` | Reusable PostgreSQL and pandas read/write helpers. |
 | `architecture.drawio` | Architecture diagram source. |
-| `collibra_dq_app/requirements.txt` | Python dependencies for the local application. |
+| `requirements.txt` | Pinned Python dependencies for the application (local and Docker). |
 
 ## Prerequisites
 
@@ -138,7 +147,7 @@ From the repository root:
 python -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
-python -m pip install -r collibra_dq_app/requirements.txt
+python -m pip install -r requirements.txt
 ```
 
 The repository includes a `.env.example`. Create a local `.env` file or export variables in the shell. `.env` is ignored by Git.
@@ -341,18 +350,16 @@ finally:
 
 ## Pre-Configured Prompt Templates
 
-The chatbot includes a library of 18 pre-configured prompt templates organized into 6 categories to help users quickly construct complex requests:
+The chatbot includes a library of 16 pre-configured prompt templates organized into 6 categories to help users quickly construct complex requests:
 
 ### Template Categories
 
-**Update Dataset** (7 templates)
+**Update Dataset** (5 templates)
 - Business Unit mapping update
 - Email alert configuration
-- Dataset definitions and metadata
-- LinkId updates
-- Data Domain tagging
-- Sub-Domain tagging
-- Update adaptive rule boundary suppress
+- Dataset definitions
+- Layer Rules
+- Suppress/Unsuppress Adaptive Rule
 
 **Create Dataset** (2 templates)
 - S3-backed dataset creation
@@ -389,7 +396,7 @@ The chatbot includes a library of 18 pre-configured prompt templates organized i
 
 **New Files:**
 - `prompt_manager.py`: Core template system with PromptTemplate and PromptTemplateManager classes
-- `prompt_templates.json`: Configuration file with 18 templates and field definitions
+- `prompt_templates.json`: Configuration file with 16 templates and field definitions
 
 **UI Integration (app.py):**
 - Category and prompt selection with auto-population of choices
