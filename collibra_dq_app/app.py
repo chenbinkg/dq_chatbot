@@ -200,6 +200,16 @@ async def _drive_agent_stream(prompt, chat_history, invocation_index, verbose, r
         if tools_parent_index is not None:
             chat_history[tools_parent_index]["metadata"]["status"] = "done"
 
+    # Strands rejects a plain-text prompt while an interrupt is pending (user typed in the
+    # chat box instead of using the form), so pass the text as the answer to every open interrupt.
+    interrupt_state = getattr(agent, "_interrupt_state", None)
+    if isinstance(prompt, str) and interrupt_state is not None and interrupt_state.activated:
+        prompt = [
+            {"interruptResponse": {"interruptId": interrupt_id, "response": {"free_text_reply": prompt}}}
+            for interrupt_id, interrupt in interrupt_state.interrupts.items()
+            if interrupt.response is None
+        ] or prompt
+
     async for event in agent.stream_async(prompt):
         if event.get("init_event_loop"):
             chat_history[invocation_index]["content"] = "Model initialized."
@@ -597,6 +607,10 @@ def get_prompts_for_category(category: str):
 
 # Anchors the Submit button inside the message textbox, bottom-right.
 APP_CSS = """
+/* Only the inner message list should scroll; the outer block scrolling shows a second, bottomless scrollbar. */
+#chat_conversation {
+    overflow: hidden !important;
+}
 #msg_box_wrap {
     position: relative;
 }
@@ -1011,7 +1025,7 @@ with gr.Blocks(title="Data Quality AI Assistant") as demo:
                 chat_history.append({"role": "user", "content": message})
                 invocation_index = len(chat_history)
                 chat_history.append(_activity_message("Agent", "Preparing request...", message_id="agent-status"))
-                yield (chat_history, "", *([gr.skip()] * _INTERRUPT_FORM_OUTPUT_COUNT))
+                yield (chat_history, "", *_hidden_interrupt_form_updates())
     
                 global agent
                 previous_agent = agent
@@ -1338,8 +1352,10 @@ with gr.Blocks(title="Data Quality AI Assistant") as demo:
     )
 
 if __name__ == "__main__":
-    logger.info("Starting DQ Chatbot on port 7860 (localhost only)")
-    demo.launch(server_name="127.0.0.1", server_port=7860, share=False, css=APP_CSS)
+    # Containers set GRADIO_SERVER_NAME=0.0.0.0 so the ALB can reach the app.
+    server_name = os.getenv("GRADIO_SERVER_NAME", "127.0.0.1")
+    logger.info("Starting DQ Chatbot on %s:7860", server_name)
+    demo.launch(server_name=server_name, server_port=7860, share=False, css=APP_CSS)
 
 # lsof -nP -iTCP:7860 -sTCP:LISTEN
 # kill 6154
