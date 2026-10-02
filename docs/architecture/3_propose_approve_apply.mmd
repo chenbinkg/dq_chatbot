@@ -1,0 +1,11 @@
+flowchart TD
+  P["propose_* tool<br/>reads current state from Collibra, builds diff"] --> S[("_pending_changes[change_id]<br/>session_id · region · payload · TTL 15m")]
+  S --> R{"Who approves?"}
+  R -->|"User types 'yes' + reason in chat"| L["LLM calls apply_dataset_change /<br/>apply_pending_changes(change_ids, reason)"]
+  R -->|"Pending approvals panel"| B["apply_selected_pending_changes<br/>calls apply_pending_changes directly (no LLM)"]
+  B --> N["Sends a message to the agent saying what was applied,<br/>so the agent can continue the workflow"]
+  L --> X["Collibra write<br/>PUT/POST datasetDefs · POST rules · alerts · BU · boundary-suppress<br/>+ POST /v3/jobs/run"]
+  B --> X
+  X --> H[("Postgres dqm_chatbot_change_history<br/>who/what/when/why")]
+  X --> Q[("_pending_jira_batches")]
+  Q -->|"user confirms done"| J["sync_jira_change_request → Jira REST<br/>update + close DQ Change Request ticket"]
