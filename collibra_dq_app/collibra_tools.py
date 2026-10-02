@@ -1982,8 +1982,8 @@ def apply_dataset_change(change_id: str, change_reason: str) -> dict[str, Any]:
     """
     if not change_reason or not change_reason.strip():
         raise ValueError(
-            "change_reason is required to apply a change. Ask the user for a brief reason "
-            "and call apply_dataset_change again with it -- the change_id is still valid."
+            "change_reason is required to apply a change. Ask the user for a brief reason via "
+            "ask_user_for_input and call apply_dataset_change again with it -- the change_id is still valid."
         )
     change = _pop_valid_change(change_id)
     client = _get_client(change["region"])
@@ -2256,10 +2256,10 @@ def ask_user_for_input(question: str, fields: list[dict[str, Any]], tool_context
     Use this whenever you need specific values from the user before you can proceed --
     e.g. a new dataset's scheduleTime, confirming or overriding suggested metaTags/
     business unit, or any other input-gathering step in a workflow (see "Creating a new
-    dataset" step c). Do NOT use this for propose_*/apply_dataset_change confirmations --
-    those already have their own diff + confirm/approve flow (chat "yes" or the Pending
-    Approvals panel); this tool is only for collecting input values the agent still needs
-    before it can call a propose_* tool in the first place.
+    dataset" step c). Also ALWAYS use it for yes/no go-ahead questions ("Shall I proceed /
+    apply?" -> a "choice" field) and for collecting change_reason (a "text" field named
+    "change_reason"), combined in one call -- never ask these in prose. Show any diff/plan in
+    your reply before calling this, since the form only renders the fields.
 
     Args:
         question: Short heading shown above the fields, e.g. "A couple of details needed
@@ -2346,8 +2346,8 @@ def apply_pending_changes(change_ids: list[str], change_reason: str) -> dict[str
         raise ValueError("change_ids must contain at least one change_id.")
     if not change_reason or not change_reason.strip():
         raise ValueError(
-            "change_reason is required to apply changes. Ask the user for a brief reason "
-            "and call apply_pending_changes again with it -- the change_ids are still valid."
+            "change_reason is required to apply changes. Ask the user for a brief reason via "
+            "ask_user_for_input and call apply_pending_changes again with it -- the change_ids are still valid."
         )
     results = []
     for change_id in change_ids:
