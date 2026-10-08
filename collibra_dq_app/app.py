@@ -21,7 +21,9 @@ import json
 import logging
 import os
 import sys
+import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 
 try:
     from dotenv import load_dotenv
@@ -51,6 +53,7 @@ agent_region = None
 mcp_client = None
 mcp_status = "Atlassian MCP has not been initialized."
 prompt_manager = PromptTemplateManager()
+_feedback_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="feedback-save")
 
 BU_MAPPING_TABLE = os.getenv("DQM_BU_MAPPING_TABLE", "public.dqm_business_unit_mapping")
 
@@ -96,6 +99,71 @@ def _activity_message(
     if parent_id:
         metadata["parent_id"] = parent_id
     return {"role": "assistant", "content": content, "metadata": metadata}
+
+
+def _new_turn_trace(user_message: str) -> dict:
+    return {
+        "turn_id": f"turn-{uuid.uuid4().hex}",
+        "user_message_id": f"message-{uuid.uuid4().hex}",
+        "assistant_message_id": f"response-{uuid.uuid4().hex}",
+        "user_message": user_message,
+        "assistant_response": "",
+        "started_at": time.monotonic(),
+        "tool_executions": [],
+    }
+
+
+def _conversation_message(role: str, content: str, message_id: str) -> dict:
+    return {"role": role, "content": content, "metadata": {"id": message_id}}
+
+
+def _sanitized_tool_input(value):
+    """Redact credential-like fields and cap strings before trace persistence."""
+    if isinstance(value, dict):
+        sanitized = {}
+        for key, item in value.items():
+            normalized_key = str(key).lower().replace("-", "_")
+            if any(marker in normalized_key for marker in ("password", "secret", "token", "authorization", "api_key")):
+                sanitized[key] = "[REDACTED]"
+            else:
+                sanitized[key] = _sanitized_tool_input(item)
+        return sanitized
+    if isinstance(value, list):
+        return [_sanitized_tool_input(item) for item in value[:100]]
+    if isinstance(value, str):
+        return value[:4000]
+    return value
+
+
+def _persist_turn_trace(trace: dict, username: str, session_id: str, region: str, agent_result=None, error=None) -> None:
+    stop_reason = getattr(agent_result, "stop_reason", None) if agent_result is not None else None
+    if error is not None:
+        status = "error"
+        stop_reason = type(error).__name__
+        for execution in trace["tool_executions"]:
+            if execution["status"] != "completed":
+                execution["status"] = "error"
+    elif stop_reason == "interrupt":
+        status = "interrupted"
+    else:
+        status = "completed"
+    try:
+        chat_store.log_agent_turn(
+            turn_id=trace["turn_id"],
+            session_id=session_id,
+            app_user=username,
+            region=region,
+            user_message_id=trace["user_message_id"],
+            assistant_message_id=trace["assistant_message_id"],
+            user_message=trace["user_message"],
+            assistant_response=trace["assistant_response"],
+            status=status,
+            stop_reason=stop_reason,
+            duration_ms=int((time.monotonic() - trace["started_at"]) * 1000),
+            tool_executions=trace["tool_executions"],
+        )
+    except Exception:
+        logger.exception("Failed to persist agent trace for turn %s", trace["turn_id"])
 
 
 def _tool_input_text(tool_input) -> str:
@@ -174,7 +242,7 @@ def _interrupt_form_updates(agent_result):
     )
 
 
-async def _drive_agent_stream(prompt, chat_history, invocation_index, verbose, result_holder):
+async def _drive_agent_stream(prompt, chat_history, invocation_index, verbose, result_holder, trace):
     """Consume one agent.stream_async(prompt) turn, mutating chat_history in place and
     yielding it after each meaningful event. `prompt` can be a new user message (str) or a
     list of interruptResponse content blocks to resume a paused ask_user_for_input call.
@@ -196,6 +264,10 @@ async def _drive_agent_stream(prompt, chat_history, invocation_index, verbose, r
         for tool_id in active_tool_ids:
             idx = tool_indices[tool_id]
             chat_history[idx]["metadata"]["status"] = "done"
+            for execution in trace["tool_executions"]:
+                if execution["execution_id"] == f"{trace['turn_id']}:{tool_id}":
+                    execution["status"] = "completed"
+                    break
         active_tool_ids.clear()
         if tools_parent_index is not None:
             chat_history[tools_parent_index]["metadata"]["status"] = "done"
@@ -261,6 +333,23 @@ async def _drive_agent_stream(prompt, chat_history, invocation_index, verbose, r
                         tool_use.get("input")
                     )
                 active_tool_ids.add(tool_id)
+                execution_id = f"{trace['turn_id']}:{tool_id}"
+                existing_execution = next(
+                    (item for item in trace["tool_executions"] if item["execution_id"] == execution_id),
+                    None,
+                )
+                sanitized_input = _sanitized_tool_input(tool_use.get("input") or {})
+                if existing_execution is None:
+                    trace["tool_executions"].append(
+                        {
+                            "execution_id": execution_id,
+                            "tool_name": tool_name,
+                            "tool_input": sanitized_input,
+                            "status": "error",
+                        }
+                    )
+                else:
+                    existing_execution["tool_input"] = sanitized_input
                 chat_history[invocation_index]["content"] = f"Waiting for {tool_name}..."
                 logger.info("Tool call: %s(%s)", tool_name, tool_use.get("input"))
                 yield chat_history
@@ -270,7 +359,9 @@ async def _drive_agent_stream(prompt, chat_history, invocation_index, verbose, r
             chat_history[invocation_index]["content"] = "Writing response..."
             if answer_index is None:
                 answer_index = len(chat_history)
-                chat_history.append({"role": "assistant", "content": ""})
+                chat_history.append(
+                    _conversation_message("assistant", "", trace["assistant_message_id"])
+                )
             # The J&J gateway returns one complete text block, so chunk it for
             # progressive display even though this is not true token streaming.
             for chunk in _display_chunks(event["data"]):
@@ -291,7 +382,14 @@ async def _drive_agent_stream(prompt, chat_history, invocation_index, verbose, r
     else:
         chat_history[invocation_index]["content"] = "Completed."
         if answer_index is None:
-            chat_history.append({"role": "assistant", "content": result_text or "No response text returned."})
+            chat_history.append(
+                _conversation_message(
+                    "assistant",
+                    result_text or "No response text returned.",
+                    trace["assistant_message_id"],
+                )
+            )
+    trace["assistant_response"] = result_text or "No response text returned."
     chat_history[invocation_index]["metadata"]["status"] = "done"
     yield chat_history
 
@@ -300,7 +398,10 @@ def _entry_text(content) -> str:
     if isinstance(content, str):
         return content
     if isinstance(content, list):
-        return "".join(block.get("text", "") for block in content if isinstance(block, dict))
+        return "".join(
+            block.get("text", "") if isinstance(block, dict) else str(block)
+            for block in content
+        )
     return ""
 
 
@@ -314,13 +415,127 @@ def _history_to_agent_messages(conversation_history: list[dict]) -> list[dict]:
         if role not in ("user", "assistant"):
             continue
         metadata = entry.get("metadata") or {}
-        if metadata:  # activity/tool/reasoning rows all carry metadata; real turns don't
+        if metadata.get("title") or metadata.get("status") or metadata.get("parent_id"):
             continue
         text = _entry_text(entry.get("content"))
         if not text:
             continue
         messages.append({"role": role, "content": [{"text": text}]})
     return messages
+
+
+def select_response_feedback(chat_history: list[dict] | None, feedback: gr.LikeData):
+    """Show the comment form while one response has active feedback selected."""
+    message_index = feedback.index[0] if isinstance(feedback.index, tuple) else feedback.index
+    if not isinstance(message_index, int) or not chat_history or not 0 <= message_index < len(chat_history):
+        return gr.update(visible=False), None, "", "Feedback is unavailable for this response."
+
+    message = chat_history[message_index]
+    metadata = message.get("metadata") if isinstance(message, dict) else getattr(message, "metadata", None)
+    if not isinstance(metadata, dict):
+        metadata = dict(metadata or {})
+    assistant_message_id = metadata.get("id")
+    if not isinstance(assistant_message_id, str) or not assistant_message_id.startswith("response-"):
+        group_start = message_index
+        while group_start > 0 and chat_history[group_start - 1].get("role") == "assistant":
+            group_start -= 1
+        group_end = message_index + 1
+        while group_end < len(chat_history) and chat_history[group_end].get("role") == "assistant":
+            group_end += 1
+        for candidate in reversed(chat_history[group_start:group_end]):
+            candidate_metadata = candidate.get("metadata") or {}
+            candidate_id = candidate_metadata.get("id")
+            if isinstance(candidate_id, str) and candidate_id.startswith("response-"):
+                assistant_message_id = candidate_id
+                break
+    if not isinstance(assistant_message_id, str) or not assistant_message_id.startswith("response-"):
+        event_value = feedback.value.get("content") if isinstance(feedback.value, dict) else feedback.value
+        event_text = _entry_text(event_value)
+        for candidate in reversed(chat_history):
+            if not isinstance(candidate, dict) or candidate.get("role") != "assistant":
+                continue
+            candidate_metadata = candidate.get("metadata") or {}
+            candidate_id = candidate_metadata.get("id")
+            if (
+                isinstance(candidate_id, str)
+                and candidate_id.startswith("response-")
+                and _entry_text(candidate.get("content")) == event_text
+            ):
+                assistant_message_id = candidate_id
+                break
+    if not isinstance(assistant_message_id, str) or not assistant_message_id.startswith("response-"):
+        assistant_message_id = None
+
+    liked = feedback.liked
+    if liked is True or str(liked).strip().lower() in {"like", "liked", "upvote", "thumbs up"}:
+        vote = 1
+        label = "upvote"
+    elif liked is False or str(liked).strip().lower() in {"dislike", "disliked", "downvote", "thumbs down"}:
+        vote = -1
+        label = "downvote"
+    else:
+        return gr.update(visible=False), None, "", ""
+
+    selection = {
+        "assistant_message_id": assistant_message_id,
+        "vote": vote,
+        "label": label,
+        "response_content": _entry_text(feedback.value),
+    }
+    return gr.update(visible=True), selection, "", ""
+
+
+def _persist_response_feedback(comment: str, username: str, selection: dict) -> None:
+    """Write one feedback record; callers choose whether to wait for completion."""
+    if selection.get("assistant_message_id"):
+        chat_store.record_response_feedback(
+            feedback_id=f"feedback-{uuid.uuid4().hex}",
+            assistant_message_id=selection["assistant_message_id"],
+            app_user=username,
+            vote=selection["vote"],
+            comment=comment,
+        )
+    else:
+        chat_store.record_unresolved_feedback(
+            feedback_id=f"feedback-{uuid.uuid4().hex}",
+            app_user=username,
+            vote=selection["vote"],
+            comment=comment,
+            response_content=selection["response_content"],
+        )
+
+
+def _persist_cancelled_feedback(username: str, selection: dict) -> None:
+    try:
+        _persist_response_feedback("", username, selection)
+    except Exception:
+        logger.exception("Failed to save commentless feedback for response %s", selection.get("assistant_message_id"))
+
+
+def submit_response_feedback(comment: str, username: str, selection: dict | None):
+    """Persist feedback synchronously so explicit comment submissions report errors."""
+    if not selection:
+        return "Select Like or Dislike on a response first.", gr.update(visible=False), "", None
+    if not username:
+        return "Please log in before submitting feedback.", gr.update(visible=True), comment, selection
+
+    try:
+        _persist_response_feedback(comment, username, selection)
+    except Exception:
+        logger.exception("Failed to save feedback for response %s", selection.get("assistant_message_id"))
+        return "Feedback could not be saved. Please try again.", gr.update(visible=True), comment, selection
+    return f"Thanks. Your {selection['label']} was saved.", gr.update(visible=False), "", None
+
+
+def cancel_feedback_comment(username: str, selection: dict | None):
+    """Dismiss immediately, saving the selected vote without a comment in the background."""
+    if not selection:
+        return "", gr.update(visible=False), "", None
+    if not username:
+        return "Please log in before submitting feedback.", gr.update(visible=True), "", selection
+
+    _feedback_executor.submit(_persist_cancelled_feedback, username, dict(selection))
+    return f"Thanks. Your {selection['label']} was saved.", gr.update(visible=False), "", None
 
 
 def _build_chat_agent(region: str = "apac"):
@@ -560,7 +775,8 @@ async def apply_selected_pending_changes(
         + f"\n\nResult: {status}\n\n"
         "Continue the workflow from here if applicable, or confirm we're done."
     )
-    chat_history.append({"role": "user", "content": nudge})
+    trace = _new_turn_trace(nudge)
+    chat_history.append(_conversation_message("user", nudge, trace["user_message_id"]))
     invocation_index = len(chat_history)
     chat_history.append(_activity_message("Agent", "Resuming...", message_id="agent-status"))
     yield status, gr.skip(), gr.skip(), gr.skip(), chat_history, *([gr.skip()] * _INTERRUPT_FORM_OUTPUT_COUNT)
@@ -569,16 +785,22 @@ async def apply_selected_pending_changes(
     agent = _ensure_chat_agent(region)
     result_holder: dict = {}
     try:
-        async for updated_history in _drive_agent_stream(nudge, chat_history, invocation_index, verbose, result_holder):
+        async for updated_history in _drive_agent_stream(
+            nudge, chat_history, invocation_index, verbose, result_holder, trace
+        ):
             yield status, gr.skip(), gr.skip(), gr.skip(), updated_history, *([gr.skip()] * _INTERRUPT_FORM_OUTPUT_COUNT)
     except Exception as e:
         logger.exception("Agent error resuming after panel approval")
         chat_history[invocation_index]["content"] = "Failed."
         chat_history[invocation_index]["metadata"]["status"] = "done"
-        chat_history.append({"role": "assistant", "content": f"Error: {e}"})
+        error_text = f"Error: {e}"
+        trace["assistant_response"] = error_text
+        chat_history.append(_conversation_message("assistant", error_text, trace["assistant_message_id"]))
+        _persist_turn_trace(trace, username, session_id, region, error=e)
         yield status, gr.skip(), gr.skip(), gr.skip(), chat_history, *_hidden_interrupt_form_updates()
         return
 
+    _persist_turn_trace(trace, username, session_id, region, result_holder.get("result"))
     try:
         chat_store.log_chat_turn(username, session_id, region, chat_history)
     except Exception:
@@ -934,7 +1156,19 @@ with gr.Blocks(title="Data Quality AI Assistant") as demo:
             # --- End Prompt Template Selector Section ---
             
             # gradio 6.x dropped the `type=` kwarg -- messages format is now the only format.
-            chatbot = gr.Chatbot(height=600, elem_id="chat_conversation")
+            chatbot = gr.Chatbot(height=600, elem_id="chat_conversation", like_user_message=False)
+            feedback_selection_state = gr.State(None)
+            with gr.Row(visible=False) as feedback_form_group:
+                feedback_comment = gr.Textbox(
+                    label="Optional feedback comment",
+                    placeholder="What was helpful or what should be improved?",
+                    lines=1,
+                    interactive=True,
+                    scale=4,
+                )
+                feedback_submit = gr.Button("Submit feedback", variant="primary", scale=1)
+                feedback_cancel = gr.Button("Cancel", scale=1)
+            feedback_status = gr.Markdown()
 
             with gr.Row(visible=False) as starter_prompts_row:
                 starter_btn_1 = gr.Button("🆕 Create a new dataset", size="sm")
@@ -1005,6 +1239,25 @@ with gr.Blocks(title="Data Quality AI Assistant") as demo:
             )
             verbose_mode = gr.Checkbox(label="Show activity and reasoning", value=True)
             clear = gr.Button("Clear")
+
+            chatbot.like(
+                select_response_feedback,
+                inputs=[chatbot],
+                outputs=[feedback_form_group, feedback_selection_state, feedback_comment, feedback_status],
+                queue=False,
+            )
+            feedback_submit.click(
+                submit_response_feedback,
+                inputs=[feedback_comment, username_state, feedback_selection_state],
+                outputs=[feedback_status, feedback_form_group, feedback_comment, feedback_selection_state],
+                queue=False,
+            )
+            feedback_cancel.click(
+                cancel_feedback_comment,
+                inputs=[username_state, feedback_selection_state],
+                outputs=[feedback_status, feedback_form_group, feedback_comment, feedback_selection_state],
+                queue=False,
+            )
     
             async def respond_async(message, chat_history, is_authed, verbose, username, session_id, region):
                 region = (region or "apac").strip().lower()
@@ -1022,7 +1275,8 @@ with gr.Blocks(title="Data Quality AI Assistant") as demo:
                     return
     
                 chat_store.set_session_context(username, session_id, region)
-                chat_history.append({"role": "user", "content": message})
+                trace = _new_turn_trace(message)
+                chat_history.append(_conversation_message("user", message, trace["user_message_id"]))
                 invocation_index = len(chat_history)
                 chat_history.append(_activity_message("Agent", "Preparing request...", message_id="agent-status"))
                 yield (chat_history, "", *_hidden_interrupt_form_updates())
@@ -1037,17 +1291,21 @@ with gr.Blocks(title="Data Quality AI Assistant") as demo:
                 result_holder: dict = {}
                 try:
                     async for updated_history in _drive_agent_stream(
-                        message, chat_history, invocation_index, verbose, result_holder
+                        message, chat_history, invocation_index, verbose, result_holder, trace
                     ):
                         yield (updated_history, "", *([gr.skip()] * _INTERRUPT_FORM_OUTPUT_COUNT))
                 except Exception as e:
                     logger.exception("Agent error")
                     chat_history[invocation_index]["content"] = "Failed."
                     chat_history[invocation_index]["metadata"]["status"] = "done"
-                    chat_history.append({"role": "assistant", "content": f"Error: {e}"})
+                    error_text = f"Error: {e}"
+                    trace["assistant_response"] = error_text
+                    chat_history.append(_conversation_message("assistant", error_text, trace["assistant_message_id"]))
+                    _persist_turn_trace(trace, username, session_id, region, error=e)
                     yield (chat_history, "", *_hidden_interrupt_form_updates())
                     return
     
+                _persist_turn_trace(trace, username, session_id, region, result_holder.get("result"))
                 try:
                     chat_store.log_chat_turn(username, session_id, region, chat_history)
                 except Exception:
@@ -1077,7 +1335,11 @@ with gr.Blocks(title="Data Quality AI Assistant") as demo:
     
                 region = (region or "apac").strip().lower()
                 chat_store.set_session_context(username, session_id, region)
-                chat_history.append({"role": "user", "content": "\n".join(display_lines) or "(submitted)"})
+                user_message = "\n".join(display_lines) or "(submitted)"
+                trace = _new_turn_trace(user_message)
+                chat_history.append(
+                    _conversation_message("user", user_message, trace["user_message_id"])
+                )
                 invocation_index = len(chat_history)
                 chat_history.append(_activity_message("Agent", "Resuming...", message_id="agent-status"))
                 # Hide the form immediately -- don't wait for the whole agent turn to finish.
@@ -1089,17 +1351,21 @@ with gr.Blocks(title="Data Quality AI Assistant") as demo:
                 result_holder: dict = {}
                 try:
                     async for updated_history in _drive_agent_stream(
-                        responses, chat_history, invocation_index, verbose, result_holder
+                        responses, chat_history, invocation_index, verbose, result_holder, trace
                     ):
                         yield (updated_history, *([gr.skip()] * _INTERRUPT_FORM_OUTPUT_COUNT))
                 except Exception as e:
                     logger.exception("Agent error resuming interrupt")
                     chat_history[invocation_index]["content"] = "Failed."
                     chat_history[invocation_index]["metadata"]["status"] = "done"
-                    chat_history.append({"role": "assistant", "content": f"Error: {e}"})
+                    error_text = f"Error: {e}"
+                    trace["assistant_response"] = error_text
+                    chat_history.append(_conversation_message("assistant", error_text, trace["assistant_message_id"]))
+                    _persist_turn_trace(trace, username, session_id, region, error=e)
                     yield (chat_history, *_hidden_interrupt_form_updates())
                     return
     
+                _persist_turn_trace(trace, username, session_id, region, result_holder.get("result"))
                 try:
                     chat_store.log_chat_turn(username, session_id, region, chat_history)
                 except Exception:
@@ -1324,7 +1590,12 @@ with gr.Blocks(title="Data Quality AI Assistant") as demo:
             demo.load(on_page_load, None, [prompt_title])
             demo.load(None, None, None, js=ENTER_TO_SUBMIT_JS)
             
-            clear.click(lambda: [], None, chatbot, queue=False)
+            clear.click(
+                lambda: ([], gr.update(visible=False), None, "", ""),
+                None,
+                [chatbot, feedback_form_group, feedback_selection_state, feedback_comment, feedback_status],
+                queue=False,
+            )
     
             resume_yes_btn.click(
                 resume_previous_chat,
@@ -1354,6 +1625,7 @@ with gr.Blocks(title="Data Quality AI Assistant") as demo:
 if __name__ == "__main__":
     # Containers set GRADIO_SERVER_NAME=0.0.0.0 so the ALB can reach the app.
     server_name = os.getenv("GRADIO_SERVER_NAME", "127.0.0.1")
+    chat_store.ensure_tables()
     logger.info("Starting DQ Chatbot on %s:7860", server_name)
     demo.launch(server_name=server_name, server_port=7860, share=False, css=APP_CSS)
 
