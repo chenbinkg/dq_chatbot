@@ -80,6 +80,19 @@ Applying a rule batch is fault-isolated: each rule is POSTed independently, so o
 
 Every applied change is written immediately to the PostgreSQL change-history audit table and queued for Jira. A separate `sync_jira_change_request` tool (called once per dataset, after the user confirms, with the dataset's market so the ticket is attached to the right Jira version) creates or reopens a "DQ Change Request" ticket under a pre-configured epic, stacks the new entries on top of its existing description, and closes it again. A changed `ruleValue` is rendered as a compact unified diff with the `---`/`+++` filename headers stripped, since Jira renders them as markup; a brand-new rule has nothing to diff against, so its value is shown verbatim instead. See `collibra_dq_app/jira_logger.py`.
 
+### Response feedback and agent traces
+
+Each agent invocation is recorded as a normalized turn with stable user/assistant message IDs, duration, stop reason, and an ordered list of tool names and sanitized inputs. Credential-like fields are redacted and model reasoning/tool outputs are not persisted. Selecting Like or Dislike on an assistant response opens an optional comment form. **Submit feedback** saves the vote and comment synchronously so an error can be shown. **Cancel** saves only the selected vote in a background worker and hides the form immediately; background write failures are logged by the application.
+
+Feedback is stored in one of two tables:
+
+| Table | Purpose |
+| --- | --- |
+| `dqm_chatbot_response_feedback` | The normal feedback path for an assistant response that has a stable `response-*` ID. Its row is linked to `dqm_chatbot_agent_turn`, so evaluation can join the vote/comment to the user request, final response, timing, and ordered tool calls. A user's later vote for the same response updates the existing row. |
+| `dqm_chatbot_unresolved_feedback` | Fallback feedback for the welcome message, legacy chat history, or resumed responses that predate stable response IDs. It stores the user, vote, optional comment, and rendered response content, but has no foreign key to an agent turn. |
+
+These records are intended for offline workflow evaluation, regression-test selection, and later distillation of successful task episodes. Raw votes or tool sequences are not automatically injected into the agent prompt.
+
 ### Atlassian investigation tools
 
 The optional Atlassian MCP integration connects the Strands agent to Jira, Confluence, and Bitbucket through the configured streamable HTTP MCP endpoint. It is useful for gathering evidence about JGPV data-quality tickets and JEJQ upstream ETL tickets. The local chatbot continues with Collibra tools if the Atlassian MCP client cannot be initialized.
@@ -116,7 +129,7 @@ Strands Agent (collibra_dq_app/dq_agent.py)
 | `collibra_dq_app/redshift_connections.py` | Static connection registry, cluster detection, S3 parsing, table sampling, table/column profiling, and key uniqueness checks. |
 | `collibra_dq_app/business_unit.py` | Business-unit hierarchy parsing and market/project inference. |
 | `collibra_dq_app/bu_mapping_reference.py` | Similarity-ranked lookups against the curated PostgreSQL mapping table. |
-| `collibra_dq_app/chat_store.py` | PostgreSQL persistence for chat history (`dqm_chatbot_chat_history`, resumable on next login) and applied-change audit trail (`dqm_chatbot_change_history`). |
+| `collibra_dq_app/chat_store.py` | PostgreSQL persistence for resumable chat history, applied-change audit trails, normalized agent/tool traces, and response feedback. |
 | `collibra_dq_app/jira_logger.py` | Creates/reopens/closes Jira "DQ Change Request" tickets, stacking new change-history entries on the existing description and attaching the ticket to the dataset's market via a Jira version. |
 | `collibra_dq_app/agent_instruction.txt` | Production system instructions, best-practice guidance, and hard safety rules for the local agent. |
 | `jnj_strands_model.py` | Strands-compatible provider for the J&J GenAI Gateway, including native tool calling and structured-output fallback. |
@@ -134,7 +147,7 @@ Strands Agent (collibra_dq_app/dq_agent.py)
 - Collibra CDQ credentials for every region the chatbot must access.
 - Redshift credentials only when sampling tables, probing clusters, or checking `linkId` uniqueness.
 - PostgreSQL credentials only when using similar-dataset or Data Domain distribution lookups.
-- PostgreSQL credentials are also required to persist chat history and the change-history audit trail (`collibra_dq_app/chat_store.py`) -- run `python collibra_dq_app/chat_store.py` once to create the tables.
+- PostgreSQL credentials are also required to persist chat history, audit trails, agent traces, and feedback (`collibra_dq_app/chat_store.py`). The application creates missing persistence tables at startup; alternatively, run `python collibra_dq_app/chat_store.py` before deployment. The database role needs `CREATE` privileges for this initialization, or a database administrator must run the migration first.
 - AWS credentials (read-only S3 permissions) only when inspecting S3 files via `list_s3_objects`/`sample_s3_file`.
 - Atlassian Jira credentials (`X_ATLASSIAN_JIRA_URL`/`X_ATLASSIAN_JIRA_PERSONAL_TOKEN`) are also used directly (outside the MCP integration) by `jira_logger.py` to log/close DQ Change Request tickets.
 - Atlassian credentials only when enabling the MCP integration.
@@ -208,12 +221,16 @@ export DB_SSLMODE='require'
 export DQM_BU_MAPPING_TABLE='public.dqm_business_unit_mapping'
 export DQM_CHAT_HISTORY_TABLE='public.dqm_chatbot_chat_history'
 export DQM_CHANGE_HISTORY_TABLE='public.dqm_chatbot_change_history'
+export DQM_AGENT_TURN_TABLE='public.dqm_chatbot_agent_turn'
+export DQM_TOOL_EXECUTION_TABLE='public.dqm_chatbot_tool_execution'
+export DQM_RESPONSE_FEEDBACK_TABLE='public.dqm_chatbot_response_feedback'
+export DQM_UNRESOLVED_FEEDBACK_TABLE='public.dqm_chatbot_unresolved_feedback'
 ```
 
 These variables are used for curated similarity/distribution lookups and for the chatbot's own
 audit tables. The reference table is read into a process-level pandas cache after its first use.
-Run `python collibra_dq_app/chat_store.py` once (with DB_* set) to create `dqm_chatbot_chat_history`
-and `dqm_chatbot_change_history` if they don't already exist.
+Run `python collibra_dq_app/chat_store.py` once (with DB_* set) to create the chat-history,
+change-history, agent-turn, tool-execution, response-feedback, and unresolved-feedback tables if they do not already exist. The Gradio application runs the same idempotent initialization at startup.
 
 ### Optional Atlassian MCP access
 
