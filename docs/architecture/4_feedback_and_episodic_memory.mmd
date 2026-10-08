@@ -1,0 +1,21 @@
+flowchart LR
+  UI["Gradio UI"] --> Turn["Agent turn"]
+  Turn --> Tools["Tool executions"]
+  Turn --> Response["Assistant response"]
+  Response --> Feedback["User feedback"]
+
+  Turn --> Trace[("Turn and trace tables")]
+  Tools --> Trace
+  Feedback --> Trace
+
+  Trace --> Evaluation["Offline evaluation"]
+  Evaluation --> Improvements["Prompt, tool, and workflow improvements"]
+
+  Trace --> Distillation["Successful episode distillation"]
+  Distillation --> Episodes[("Episodic memory")]
+  Episodes --> Retriever["Episode retrieval"]
+  Retriever --> Turn
+
+  Feedback --> PreferenceReview["Explicit preference extraction"]
+  PreferenceReview --> Preferences[("User preferences")]
+  Preferences --> Turn
