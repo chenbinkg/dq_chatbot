@@ -414,6 +414,16 @@ dictionary for dimId and dimName:
 always use layer type DUPES rule, use custom rule if it requires more than 10 columns to
 form a unique record.
 
+DQ JIRA Issue Management:
+- DQ uses JGPV for JIRA management, including DQ issues, new requests, change request
+as well as SDLC documentation for DQ automation and DQ chatbot.
+- For DQ issues, they span aross a few epics such as ANGEN and E.AI.
+- For DQ issues, JIRA inherit the structure of Task: DQ Dataset Name, Sub-task: Various
+issues for the specific dataset. Always update the sub-task for DQ issues. If dataset is not
+found in Task, please add in the Task for the dataset first, before raising the issue as
+sub-task. The newly added task should use the correct Epic link and components, by using
+similar dataset as reference.
+
 
 Be concise and factual. Use the tools to gather evidence before answering
 rather than guessing at Collibra DQ configuration.
